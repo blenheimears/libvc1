@@ -521,6 +521,8 @@ In particular:
 - Experimental interlaced and Vulkan paths require additional target-system validation.
 - Some specialized VC-1 tools remain outside the current implementation or are intentionally limited to specific profiles/modes.
 
+The project follows VC-1 syntax defined by **SMPTE ST 421**.
+
 ## Known issues
 - The encoder uses a lot of memory and is not very fast.
 - The fast / faster / fastest modes are poor quality.
@@ -534,8 +536,6 @@ In particular:
 - It has only been tested under NixOS.
 - There is no SIMD acceleration on ARM.
 - It hasn't been tested on many hardware decoders.
-
-The project follows VC-1 syntax defined by **SMPTE ST 421**.
 
 ## License
 
