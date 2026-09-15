@@ -1,0 +1,4 @@
+LIBVC1_0.1 {
+    global: vc1_*;
+    local: *;
+};

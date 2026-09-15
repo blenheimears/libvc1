@@ -1,0 +1,183 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer CurBuffer { uint cur_words[]; };
+layout(set = 0, binding = 1, std430) readonly buffer RefBuffer { uint ref_words[]; };
+layout(set = 0, binding = 2, std430) readonly buffer CandidateBuffer { ivec2 candidates[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer ResultBuffer { uint costs[]; };
+
+layout(push_constant) uniform Params {
+    int width;
+    int height;
+    int x0;
+    int y0;
+    int bw;
+    int bh;
+    int sample_stride;
+    int bilinear;
+    int rnd;
+    int metric;          // 0=SAD, 1=SATD
+    int candidate_count;
+    int reserved;
+} pc;
+
+uint load_u8_cur(int index) {
+    uint word = cur_words[uint(index) >> 2u];
+    return (word >> ((uint(index) & 3u) * 8u)) & 255u;
+}
+
+uint load_u8_ref(int index) {
+    uint word = ref_words[uint(index) >> 2u];
+    return (word >> ((uint(index) & 3u) * 8u)) & 255u;
+}
+
+int sample_ref(int x, int y) {
+    x = clamp(x, 0, pc.width - 1);
+    y = clamp(y, 0, pc.height - 1);
+    return int(load_u8_ref(y * pc.width + x));
+}
+
+int floor_div4(int v) {
+    return v >= 0 ? v / 4 : -((-v + 3) / 4);
+}
+
+int arshift_floor(int v, int n) {
+    if (v >= 0) return v >> n;
+    int d = 1 << n;
+    return -((-v + d - 1) / d);
+}
+
+int mspel_filter4(int a, int b, int c, int d, int mode) {
+    if (mode == 1) return -4 * a + 53 * b + 18 * c - 3 * d;
+    if (mode == 2) return -a + 9 * b + 9 * c - d;
+    if (mode == 3) return -3 * a + 18 * b + 53 * c - 4 * d;
+    return b;
+}
+
+int predict_luma(int x, int y, ivec2 mvq) {
+    int ix = floor_div4(mvq.x);
+    int iy = floor_div4(mvq.y);
+    int hm = mvq.x - ix * 4;
+    int vm = mvq.y - iy * 4;
+    int sx = x + ix;
+    int sy = y + iy;
+
+    if (pc.bilinear != 0) {
+        int a = sample_ref(sx, sy);
+        if (hm == 0 && vm == 0) return a;
+        int b = sample_ref(sx + 1, sy);
+        int c = sample_ref(sx, sy + 1);
+        if (hm != 0 && vm != 0) {
+            int d = sample_ref(sx + 1, sy + 1);
+            return (a + b + c + d + (pc.rnd != 0 ? 1 : 2)) >> 2;
+        }
+        if (hm != 0) return (a + b + (pc.rnd != 0 ? 0 : 1)) >> 1;
+        return (a + c + (pc.rnd != 0 ? 0 : 1)) >> 1;
+    }
+
+    if (hm == 0 && vm == 0) return sample_ref(sx, sy);
+    int v;
+    if (hm != 0 && vm != 0) {
+        const int shift_value[4] = int[4](0, 5, 1, 5);
+        int shift = (shift_value[hm] + shift_value[vm]) >> 1;
+        int r1 = (1 << (shift - 1)) + (pc.rnd != 0 ? 1 : 0) - 1;
+        int t[4];
+        for (int k = -1; k <= 2; ++k) {
+            int raw = mspel_filter4(sample_ref(sx + k, sy - 1),
+                                    sample_ref(sx + k, sy),
+                                    sample_ref(sx + k, sy + 1),
+                                    sample_ref(sx + k, sy + 2), vm);
+            t[k + 1] = arshift_floor(raw + r1, shift);
+        }
+        int raw = mspel_filter4(t[0], t[1], t[2], t[3], hm);
+        v = arshift_floor(raw + 64 - (pc.rnd != 0 ? 1 : 0), 7);
+    } else if (vm != 0) {
+        int raw = mspel_filter4(sample_ref(sx, sy - 1), sample_ref(sx, sy),
+                                sample_ref(sx, sy + 1), sample_ref(sx, sy + 2), vm);
+        int bias = vm == 2 ? (7 + (pc.rnd != 0 ? 1 : 0)) : (31 + (pc.rnd != 0 ? 1 : 0));
+        v = arshift_floor(raw + bias, vm == 2 ? 4 : 6);
+    } else {
+        int raw = mspel_filter4(sample_ref(sx - 1, sy), sample_ref(sx, sy),
+                                sample_ref(sx + 1, sy), sample_ref(sx + 2, sy), hm);
+        int bias = hm == 2 ? (8 - (pc.rnd != 0 ? 1 : 0)) : (32 - (pc.rnd != 0 ? 1 : 0));
+        v = arshift_floor(raw + bias, hm == 2 ? 4 : 6);
+    }
+    return clamp(v, 0, 255);
+}
+
+uint sad_cost(ivec2 mvq) {
+    int aw = max(0, min(pc.bw, pc.width - pc.x0));
+    int ah = max(0, min(pc.bh, pc.height - pc.y0));
+    int ss = max(pc.sample_stride, 1);
+    uint total = 0u;
+    for (int y = 0; y < ah; y += ss) {
+        for (int x = 0; x < aw; x += ss) {
+            int cur = int(load_u8_cur((pc.y0 + y) * pc.width + pc.x0 + x));
+            int pred = predict_luma(pc.x0 + x, pc.y0 + y, mvq);
+            total += uint(abs(cur - pred));
+        }
+    }
+    if (ss > 1) total *= uint(ss * ss);
+    return total;
+}
+
+uint satd4x4_tile(ivec2 mvq, int bx, int by, int aw, int ah) {
+    int d[16];
+    for (int yy = 0; yy < 4; ++yy) {
+        for (int xx = 0; xx < 4; ++xx) {
+            int px = bx + xx;
+            int py = by + yy;
+            int value = 0;
+            if (px < aw && py < ah) {
+                int cur = int(load_u8_cur((pc.y0 + py) * pc.width + pc.x0 + px));
+                int pred = predict_luma(pc.x0 + px, pc.y0 + py, mvq);
+                value = cur - pred;
+            }
+            d[yy * 4 + xx] = value;
+        }
+    }
+
+    int t[16];
+    for (int y = 0; y < 4; ++y) {
+        int a0 = d[y * 4 + 0] + d[y * 4 + 3];
+        int a1 = d[y * 4 + 1] + d[y * 4 + 2];
+        int a2 = d[y * 4 + 1] - d[y * 4 + 2];
+        int a3 = d[y * 4 + 0] - d[y * 4 + 3];
+        t[y * 4 + 0] = a0 + a1;
+        t[y * 4 + 1] = a3 + a2;
+        t[y * 4 + 2] = a0 - a1;
+        t[y * 4 + 3] = a3 - a2;
+    }
+
+    uint tile = 0u;
+    for (int x = 0; x < 4; ++x) {
+        int a0 = t[0 * 4 + x] + t[3 * 4 + x];
+        int a1 = t[1 * 4 + x] + t[2 * 4 + x];
+        int a2 = t[1 * 4 + x] - t[2 * 4 + x];
+        int a3 = t[0 * 4 + x] - t[3 * 4 + x];
+        tile += uint(abs(a0 + a1));
+        tile += uint(abs(a3 + a2));
+        tile += uint(abs(a0 - a1));
+        tile += uint(abs(a3 - a2));
+    }
+    return (tile + 1u) >> 1u;
+}
+
+uint satd_cost(ivec2 mvq) {
+    int aw = max(0, min(pc.bw, pc.width - pc.x0));
+    int ah = max(0, min(pc.bh, pc.height - pc.y0));
+    uint total = 0u;
+    for (int by = 0; by < pc.bh; by += 4)
+        for (int bx = 0; bx < pc.bw; bx += 4)
+            if (bx < aw && by < ah)
+                total += satd4x4_tile(mvq, bx, by, aw, ah);
+    return total;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(pc.candidate_count)) return;
+    ivec2 mvq = candidates[idx];
+    costs[idx] = pc.metric == 0 ? sad_cost(mvq) : satd_cost(mvq);
+}
