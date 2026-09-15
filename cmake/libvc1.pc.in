@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libvc1
+Description: VC-1 encoder library
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lvc1
+Cflags: -I${includedir}
