@@ -535,6 +535,7 @@ The project follows VC-1 syntax defined by **SMPTE ST 421**.
 - Large motion vectors currently produce glitchy video in WMV9 mode. Capped at 255 by default to prevent this issue.
 - It has only been tested under NixOS.
 - There is no SIMD acceleration on ARM.
+- The Bulldozer / Piledriver-targeted SIMD acceleration has not been tested on a real CPU.
 - It hasn't been tested on many hardware decoders.
 
 ## License
