@@ -251,6 +251,8 @@ rate
 satd
 rd
 ```
+The default in normal mode is satd.
+rd is very slow and probably not worth using.
 
 Long-range search can compare local UMH results with propagated/content-assisted distant candidates instead of exhaustively scanning the full extended-MV space.
 
@@ -528,6 +530,7 @@ The project follows VC-1 syntax defined by **SMPTE ST 421**.
 - The fast / faster / fastest modes are poor quality.
 - Interlaced coding is poor quality.
 - Some scenes trip the encoder up / produce poor quality.
+- 2-pass encoding is not supported. It might be added in the future if it's determined to be beneficial.
 - Vulkan encoding is probably slower than CPU encoding, even on a fast GPU.
 - Sometimes it might not fully utilize the available CPU.
 - The SIMD acceleration targeted at specific CPUs is not always faster on that CPU.
