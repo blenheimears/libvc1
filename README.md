@@ -42,6 +42,7 @@ This path writes no M2TS/ASF/Matroska container. `--es-out` remains available fo
 - Adaptive entropy-table and bitplane decisions
 - Skipped-picture coding for exact duplicate input frames
 - One-pass **ABR + VBV/HRD** rate control
+- Two-pass rate control
 - Constant-quantizer mode
 - Scene-cut I-picture insertion with a configurable cooldown
 - GOP-level multithreading
@@ -186,6 +187,8 @@ For authoring workflows, the raw Advanced Profile stream can also be saved with 
 
 The normal bounded-rate path uses libvc1's one-pass ABR + VBV/HRD controller. The default macroblock-class allocation weights are **I=5.0, P=1.0, B=0.70**; intra macroblocks inside P/B pictures use the I weight.
 
+2-pass rate control is also available.
+
 ```sh
 # Target bitrate.
 ./build/vc1enc -i input.y4m -o output.m2ts --bitrate 20M
@@ -199,6 +202,10 @@ The normal bounded-rate path uses libvc1's one-pass ABR + VBV/HRD controller. Th
 
 # Legal low-Q half steps are accepted.
 ./build/vc1enc -i input.y4m -o output.m2ts --cq 4.5
+
+# 2-pass
+./build/vc1enc -i input.y4m -o output.m2ts --bitrate 20M --pass-stats pass.log --pass 1
+./build/vc1enc -i input.y4m -o output.m2ts --bitrate 20M --pass-stats pass.log --pass 2
 ```
 
 `--quantizer-type auto|uniform|nonuniform` controls picture quantizer selection. DQUANT and perceptual AQ can further redistribute quality within a picture.
@@ -530,7 +537,6 @@ The project follows VC-1 syntax defined by **SMPTE ST 421**.
 - The fast / faster / fastest modes are poor quality.
 - Interlaced coding is poor quality.
 - Some scenes trip the encoder up / produce poor quality.
-- 2-pass encoding is not supported. It might be added in the future if it's determined to be beneficial.
 - Vulkan encoding is probably slower than CPU encoding, even on a fast GPU.
 - Sometimes it might not fully utilize the available CPU.
 - The SIMD acceleration targeted at specific CPUs is not always faster on that CPU.
