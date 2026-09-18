@@ -1,7 +1,9 @@
 #include <libvc1.h>
+#include "../src/encoder_two_pass.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -121,6 +123,13 @@ void require_accept(vc1_param_t p,const char* what) {
 void require_reject(vc1_param_t p,const char* what) {
     if (accepts(p)) throw std::runtime_error(std::string(what)+" unexpectedly accepted");
 }
+void require_reject_reason(vc1_param_t p,const char* needle) {
+    vc1_t* e=vc1_encoder_open(&p);
+    if (e) { vc1_encoder_close(e); throw std::runtime_error("Blu-ray pass 2 limit unexpectedly accepted"); }
+    if (std::string(vc1_encoder_last_error(nullptr)).find(needle)==std::string::npos)
+        throw std::runtime_error(std::string("wrong rejection reason for Blu-ray pass 2: ")+
+                                 vc1_encoder_last_error(nullptr));
+}
 }
 
 int main() {
@@ -188,12 +197,64 @@ int main() {
         require_reject(p,"Blu-ray >one-second keyint");
         p=base(); p.b_bluray_compat=1; p.i_rc_method=VC1_RC_ABR; p.i_bitrate=41000000ull; p.i_vbv_buffer_size=30000000ull;
         require_reject(p,"Blu-ray >40M bitrate");
+        p.i_two_pass=2; p.psz_two_pass_stats_file="missing-two-pass-stats";
+        require_reject_reason(p,"bitrate");
         p=base(); p.b_bluray_compat=1; p.i_rc_method=VC1_RC_ABR; p.i_bitrate=38000000ull; p.i_vbv_buffer_size=30000001ull;
         require_reject(p,"Blu-ray >30M VBV");
+        p.i_two_pass=2; p.psz_two_pass_stats_file="missing-two-pass-stats";
+        require_reject_reason(p,"VBV");
         p=base(); p.b_bluray_compat=1; p.i_profile=VC1_PROFILE_MAIN;
         require_reject(p,"Blu-ray Main Profile");
 
-        std::puts("Blu-ray compatibility gating and in-band frame-rate signaling ok");
+        // A valid single-picture stats fixture exercises *pass-2 opening*,
+        // including the measured whole-film planner and signaled HRD rate.
+        // Bitrate, peak and buffer are independently changeable between passes.
+        p=base(); p.b_bluray_compat=1; p.i_rc_method=VC1_RC_ABR;
+        p.i_bitrate=20000000ull; p.i_vbv_buffer_size=30000000ull;
+        p.i_two_pass=2;
+        const std::string stats_path="libvc1-bluray-peak-regression.stats";
+        p.psz_two_pass_stats_file=stats_path.c_str();
+        {
+            std::ofstream f(stats_path,std::ios::binary|std::ios::trunc);
+            if (!f) throw std::runtime_error("cannot create Blu-ray stats test fixture");
+            f<<"LIBVC1_TWO_PASS 2 "<<vc1_twopass::signature(p)<<"\n"
+             <<"F 0 0 0 I 100000 10 1000 8160 0 42 20 10\n"
+             <<"END 1 100000\n";
+        }
+        auto check_hrd=[&](uint64_t lower_rate,uint64_t upper_rate,
+                           uint64_t lower_buffer,uint64_t upper_buffer) {
+            vc1_t* e=vc1_encoder_open(&p);
+            if (!e) throw std::runtime_error(std::string("Blu-ray 2pass open failed: ")+vc1_encoder_last_error(nullptr));
+            vc1_stats_t st{};
+            const int rc=vc1_encoder_stats(e,&st);
+            vc1_encoder_close(e);
+            if (rc<0 || st.i_hrd_rate_bits<lower_rate || st.i_hrd_rate_bits>upper_rate ||
+                st.i_hrd_buffer_bits<lower_buffer || st.i_hrd_buffer_bits>upper_buffer)
+                throw std::runtime_error("Blu-ray average/peak/buffer are not independent in HRD");
+        };
+        // 20M average MUST NOT become the HRD transmission rate: default peak 40M.
+        check_hrd(39990000ull,40000000ull,29990000ull,30000000ull);
+        p.i_peak_bitrate=30000000ull;
+        check_hrd(29990000ull,30000000ull,29990000ull,30000000ull);
+        p.i_vbv_buffer_size=20000000ull;
+        check_hrd(29990000ull,30000000ull,19990000ull,20000000ull);
+        p.i_peak_bitrate=40000001ull;
+        require_reject_reason(p,"peak bitrate");
+        p.i_peak_bitrate=19000000ull;
+        require_reject_reason(p,"exceeds peak");
+        p.i_peak_bitrate=40000000ull; p.i_vbv_buffer_size=30000001ull;
+        require_reject_reason(p,"VBV");
+        std::remove(stats_path.c_str());
+
+        // Existing unrestricted non-Blu-ray pass 2 must reject, not ignore,
+        // an explicit peak rate. One-pass may use a separate peak.
+        p=base(); p.i_rc_method=VC1_RC_ABR; p.i_bitrate=20000000ull;
+        p.i_peak_bitrate=40000000ull;
+        require_accept(p,"one-pass independent peak");
+        p.i_two_pass=2; p.psz_two_pass_stats_file="missing-two-pass-stats";
+        require_reject_reason(p,"--max-bitrate requires --bluray-compat");
+
+        std::puts("Blu-ray compatibility, independent average/peak/buffer, and timing ok");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr,"Blu-ray compatibility test failed: %s\n",e.what());

@@ -191,7 +191,7 @@ with tempfile.TemporaryDirectory(prefix='libvc1-block-weights-') as d:
     norm_log=default_log.replace('0.70','0.7')
     if 'weights=I:5/P:1/B:0.7' not in norm_log:
         raise SystemExit('startup options did not report default I/P/B block weights')
-    if 'rate-mode=abr, ceiling=' not in norm_log:
+    if 'rate-mode=abr, target=' not in norm_log:
         raise SystemExit('startup options did not report ABR ceiling')
     if norm_log.find('weights=I:') > norm_log.find('encoded '):
         raise SystemExit('block weights were reported after rather than before the encode')

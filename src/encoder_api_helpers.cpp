@@ -34,7 +34,7 @@ int vc1_param_default(vc1_param_t *p) {
     p->b_scene_cut=1; p->f_scene_cut_min_interval=0.25; p->b_fixed_gop_grid=0; p->b_fade_compensation=1; p->b_loop_filter=1; p->b_overlap=1; p->b_variable_transforms=1; p->b_dquant=1;
     p->i_trellis=1; p->b_adaptive_quality=1; p->f_aq_strength=1.0; p->b_intra_only=0; p->b_skip_identical_frames=1;
     p->b_ac_coding=1; p->i_ac_mode=VC1_AC_AUTO; p->i_ac_y_table=0; p->i_ac_c_table=0;
-    p->i_rc_method=VC1_RC_ABR; p->i_bitrate=38000000ull; p->i_vbv_buffer_size=30000000ull;
+    p->i_rc_method=VC1_RC_ABR; p->i_bitrate=38000000ull; p->i_peak_bitrate=0; p->i_vbv_buffer_size=30000000ull;
     p->i_qp_constant=2; p->b_qp_half=0; p->b_halfqp=1; p->i_quantizer_type=VC1_QUANTIZER_AUTO; p->b_rc_maximize=0;
     p->f_rc_i_weight=5.0; p->f_rc_p_weight=1.0; p->f_rc_b_weight=0.70;
     p->f_rc_residual_threshold=8.0; p->f_rc_residual_width=24.0; p->f_rc_residual_max_q_boost=0.0; p->f_inter_intra_threshold=0.80;
@@ -42,6 +42,7 @@ int vc1_param_default(vc1_param_t *p) {
     p->i_simd=VC1_SIMD_AUTO; p->b_simd_fma=1; p->b_simd_benchmark_all=1;
     for (int i=0;i<VC1_SIMD_PRIMITIVE_COUNT;++i) p->i_simd_primitive[i]=VC1_SIMD_AUTO;
     p->b_recon=0; p->b_transform_info=0; p->b_debug_stats=0; p->b_debug_macroblock_stats=0; p->b_speed_profile=0; p->b_debug_disable_p_intra=0; p->b_debug_disable_b_intra=0; p->b_emit_sequence_header=1;
+    p->i_two_pass=0; p->psz_two_pass_stats_file=nullptr; p->b_two_pass_dynamic_weights=1; p->f_two_pass_dynamic_strength=1.0;
     return 0;
 }
 

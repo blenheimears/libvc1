@@ -50,24 +50,9 @@ public:
     }
     void vlc(uint32_t code, int n) { bits(code, n); }
     size_t bit_count() const { return total_bits_; }
-    void append(const BitWriter& other) {
-        for (uint8_t v : other.data_) bits(v,8);
-        if (other.bits_ > 0) {
-            for (int i=other.bits_-1;i>=0;--i) bit((other.cur_ >> i) & 1u);
-        }
-    }
-    std::vector<uint8_t> finish_rbdu() {
-        // VC-1 Advanced Profile RBDU trailing bits: one stop bit followed by zero padding.
-        bit(true);
-        while (bits_ != 0) bit(false);
-        return data_;
-    }
-    std::vector<uint8_t> finish_raw() {
-        // Simple/Main Profile frames in ASF are byte-aligned with zero padding;
-        // they are not RBDUs and therefore have no rbdu_stop_one_bit.
-        while (bits_ != 0) bit(false);
-        return data_;
-    }
+    void append(const BitWriter& other);
+    std::vector<uint8_t> finish_rbdu();
+    std::vector<uint8_t> finish_raw();
 private:
     std::vector<uint8_t> data_;
     uint8_t cur_ = 0;
@@ -75,27 +60,8 @@ private:
     size_t total_bits_ = 0;
 };
 
-inline std::vector<uint8_t> escape_ebdu(const std::vector<uint8_t>& in) {
-    std::vector<uint8_t> out;
-    out.reserve(in.size() + in.size()/64 + 8);
-    int zeros = 0;
-    for (uint8_t b : in) {
-        if (zeros >= 2 && b <= 0x03) {
-            out.push_back(0x03);
-            zeros = 0;
-        }
-        out.push_back(b);
-        if (b == 0) ++zeros; else zeros = 0;
-    }
-    return out;
-}
-
-inline std::vector<uint8_t> bdu(uint8_t suffix, std::vector<uint8_t> rbdu) {
-    auto e = escape_ebdu(rbdu);
-    std::vector<uint8_t> out{0x00,0x00,0x01,suffix};
-    out.insert(out.end(), e.begin(), e.end());
-    return out;
-}
+std::vector<uint8_t> escape_ebdu(const std::vector<uint8_t>& in);
+std::vector<uint8_t> bdu(uint8_t suffix,std::vector<uint8_t> rbdu);
 
 struct Frame {
     int width = 0, height = 0;
@@ -286,7 +252,7 @@ struct EncoderConfig {
     bool loop_filter = true;
     bool overlap = true; // VC-1 overlap transform smoothing; CONDOVER at Advanced PQ<=8.
     int trellis = 1; // 0=scalar, 1=fast bounded trellis, 2=wider high-quality trellis.
-    bool adaptive_quality = true; // GOP lookahead + perceptual block RDO.
+    bool adaptive_quality = true; // perceptual block RDO and bounded ABR adaptation.
     double aq_strength = 1.0;
     bool aq_predictable_texture = false; // per-picture internal ABR/AQ hint; not public ABI.
     // Internal ABR macroblock-class allocation. The picture controller supplies

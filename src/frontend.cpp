@@ -653,28 +653,129 @@ static void apply_simd_primitive_overrides(vc1_param_t& param,const std::string&
 }
 
 static void usage(const char* argv0) {
-    std::cerr << "Usage: " << argv0
-              << " [-i input.y4m|-] -o output.vc1|output.m2ts|output.wmv|output.mkv [--format auto|raw|m2ts|wmv|wvc1|mkv] [--codec auto|wvc1|wmv3] [--es-out out.vc1] [--recon-out out.yuv] [--debug-transforms out.y4m] [--rc-stats file.csv] [--debug-stats file.csv] [--macroblock-stats file.csv] [--speed-profile report.txt] [--input-fps RATE] [--max-frames N] [--threads N] [--intra-gop-parallelism] [--compute cpu|vulkan] [--compute-device N] [--vulkan-min-batch N] [--vulkan-force] [--simd auto|none|x86-64-v1|prescott|k10|conroe|penryn|x86-64-v2|sandybridge|bulldozer|piledriver|avx2-partial|x86-64-v3|x86-64-v4] [--benchmark-all|--benchmark-selective] [--simd-primitive NAME=TIER[,NAME=TIER...]] [--simd-fma]\n"
-              << "       [--bluray-compat] [--bitrate TARGET] [--buffer-size BITS] [--rc-maximize] [--i-block-weight X] [--p-block-weight X] [--b-block-weight X] [--residual-priority-threshold X] [--residual-priority-width X] [--residual-priority-strength X] [--inter-intra-threshold X] | [--cq Q] [--quantizer-type auto|uniform|nonuniform] [--no-halfqp]\n"
-              << "       [--fast|--faster|--fastest] [--keyint N] [--bframes 0|1|2] [--search-range N] [--local-search-range N] [--me-quality sad|rate|satd|rd] [--long-range-search compare|local-good|legacy] [--distant-match-max-error MAE] [--scene-cut|--no-scene-cut] [--scene-threshold X] [--scene-cut-interval SECONDS] [--fixed-gop-grid] [--trellis 0|1|2] [--aq-strength X] [--no-aq] [--no-scene-cut] [--no-fade-comp] [--overlap|--no-overlap] [--no-loop-filter] [--dquant|--no-dquant] [--fixed-8x8] [--skip-identical-frames|--no-skip-identical-frames] [--debug-disable-p-intra] [--debug-disable-b-intra] [--debug-disable-pb-intra] [--intra-only]\n"
-              << "       [--dc-only] [--ac-mode auto|vlc|esc3] [--ac-y-table 0|1|2] [--ac-c-table 0|1|2]\n"
-              << "       cat input.y4m | " << argv0 << " -o output.m2ts\n"
-              << "vc1enc is the libvc1 command-line frontend. Encoding is performed through libvc1; Y4M parsing and M2TS/ASF/Matroska muxing remain in this frontend.\n"
-              << "Output defaults from the extension: .vc1 selects a raw VC-1 Advanced Profile elementary stream, .mkv selects Matroska with VC-1 Advanced Profile/WVC1, .wmv selects WMV9/WMV3 Main Profile in ASF, and other extensions select VC-1 Advanced Profile in M2TS.\n"
-              << "For .mkv/--format mkv, --codec wmv3 (alias wmv9) selects WMV9 Main Profile instead; --codec wvc1 (alias vc1) selects the default Advanced Profile. MKV output requires libmatroska/libebml at build time.\n"
-              << "Use --format raw (aliases: vc1, elementary) for a containerless Advanced Profile elementary stream, or --format wvc1 for Advanced Profile/WVC1 in ASF. Y4M Ip, It (top-field-first), and Ib (bottom-field-first) inputs are accepted; interlaced input requires Advanced Profile. --input-fps RATE (alias --fps) overrides a bad Y4M F tag; use NUM/DEN or NUM:DEN for exact rates such as 24000/1001. --bluray-compat applies only Blu-ray VC-1 codec constraints (profile/level, legal picture formats/frame rates, 40 Mbit/s video ceiling, 30 Mbit VBV, and roughly one-second keyframe spacing); it never selects or restricts the output container.\n"
-              << "Rate control has two modes: the default one-pass ABR+VBV model and unbounded constant-Q (--cq). The ABR defaults remain 38 Mbit/s and 30 Mbit VBV; --rc-maximize biases it toward fuller bitrate use when headroom is available. ABR distributes each GOP budget by macroblock coding class with relative I/P/B weights; defaults are I=5.0, P=1.0, B=0.70. Intra macroblocks use the I weight even when they occur inside P or B pictures; temporal P/B macroblocks use the P/B weights. --i-block-weight, --p-block-weight, and --b-block-weight adjust them independently; the older --i-frame-weight/--p-frame-weight/--b-frame-weight names remain aliases. The weights are normalized over the analyzed GOP block mix, so multiplying all three by the same factor does not change the requested average bitrate. These controls do not apply to --cq. Poorly predicted temporal blocks use a smooth luma-MAE protection ramp: --residual-priority-threshold sets its lower edge (default 8), --residual-priority-width its transition width (default 24), and --residual-priority-strength the maximum finer local MQUANT shift (default 0/off; set a positive value to enable it). --inter-intra-threshold controls the P/B spatial-vs-temporal proxy ratio (default 0.80; higher selects intra more readily). --rc-stats writes lightweight rate-control diagnostics; --debug-stats writes extended per-frame coding decisions plus reconstruction quality (MSE/SNR/PSNR) and enables reconstruction only for the debug run. --macroblock-stats is sectioned by one config metadata block, one frame-summary row per frame, then only block-varying rows; frame/config values are not repeated per macroblock. It includes actual local bits, coding/prediction mode, reference frame/MVs, quantizer/transform state, source brightness/activity, temporal and motion-prediction error, residual-priority ramp/boost, inter-vs-intra decision ratio, dark-detail/color AQ scores, and final reconstruction quality.\n"
-              << "--speed-profile FILE enables aggregate encoder timing and writes one compact ranked summary after the encode. It records only fixed counters (calls plus accumulated time) for major operations/features such as P/B analysis, motion search/refinement, transform RDO, trellis, AQ, DQUANT, entropy, overlap, and loop filtering; it never writes per-frame or per-macroblock timing records. Profiling adds timer overhead and feature timers may overlap, so use it to identify large contributors rather than benchmark tiny differences.\n"
-              << "Threading uses independent GOP workers by default. --intra-gop-parallelism additionally enables bounded scene/B-picture helper work inside each GOP; --no-intra-gop-parallelism disables it explicitly.\n"
-              << "Threshold scene detection is on by default. --scene-cut-interval sets the minimum source-time spacing between scene-cut I pictures (default 0.25 second, independent of --keyint; 0 disables the cooldown), while --no-scene-cut disables threshold detection. Generic VC-1 uses a 120-frame automatic keyframe interval; --keyint may set any positive interval permitted by the selected VC-1 level. --bluray-compat instead defaults to and enforces roughly one second. A separate adaptive I safety net is inserted if hybrid motion search finds no usable macroblock match; a threshold cut suppressed by the cooldown cannot re-enter through that safety net on the same boundary. --fixed-gop-grid suppresses unscheduled adaptive I pictures.\n"
-              << "Advanced Profile exact duplicate input frames use normative PTYPE=Skipped pictures by default, preserving the nominal frame cadence while repeating the previous reconstructed reference. --no-skip-identical-frames disables this optimization.\n"
-              << "--debug-disable-p-intra suppresses whole-macroblock intra selection in P pictures only.\n"
-              << "--debug-disable-b-intra suppresses intra macroblock selection in B pictures (and therefore BI promotion) only.\n"
-              << "--debug-disable-pb-intra suppresses both P- and B-picture intra macroblock selection. These are diagnostic isolation switches; motion search/refinement, transforms, DQUANT, overlap, deblocking, entropy coding, and rate control are otherwise unchanged.\n"
-              << "Long-range motion search defaults to --long-range-search compare. Distant candidates with luma MAE <=6 are accepted as strong matches; otherwise they must improve local SAD by at least 25% and remain at or below --distant-match-max-error (default 255 MAE, effectively no absolute ceiling). This confidence gate applies to propagated and content-signature distant vectors, preventing merely-less-bad cross-scene matches; --long-range-search legacy retains the historical distant-first short-circuit. --long-range-search local-good skips distant work after a strong local match.\n"
-              << "Motion estimation is staged: --me-quality sad uses SAD only; rate adds coded MV cost; satd (the default) re-ranks the SAD shortlist with Hadamard SATD plus MV rate; rd runs the slower codec-aware transform/quantizer RD pass on the best SATD finalists, including chroma. Speed presets select satd/rate/sad respectively for --fast/--faster/--fastest. Later options override preset settings.\n"
-              << "Vulkan compute is experimental and never activates by default; the default is --compute cpu (legacy --compute auto is also CPU-only). --compute vulkan explicitly opts in, benchmarks Vulkan against the selected CPU/SIMD motion-cost path, and uses Vulkan only for batch sizes where it wins. Add --vulkan-force to that opt-in to bypass benchmark rejection and force eligible Vulkan work. --compute-device selects the Vulkan physical-device ordinal, and --vulkan-min-batch sets the user floor below which GPU dispatch is never attempted. WMV3/Main remains CPU-only unless a future release adds support.\n"
-              << "SIMD defaults to auto and benchmarks every built target compatible with the current CPU for each accelerated primitive independently. --benchmark-selective restores the older gap-only policy for intermediate Prescott/K10/Conroe/Penryn/Sandy Bridge/Bulldozer/Piledriver/AVX2-partial targets; --benchmark-all explicitly selects the default all-compatible policy. Neither mode bypasses required feature flags (including FMA4 for Bulldozer/Piledriver). Detection uses CPU feature flags only, never vendor/name/model. scalar remains an alias for none. --simd-primitive NAME=TIER overrides individual primitives, may be repeated, and accepts comma-separated assignments; later assignments win.\n";
+    std::cerr << "Usage: " << argv0 << " [-i INPUT.y4m|-] -o OUTPUT [OPTIONS]\n"
+              << "       " << argv0 << " -i INPUT.y4m --pass 1 --pass-stats FILE [OPTIONS]\n"
+              << "       " << argv0 << " -i INPUT.y4m --pass 2 --pass-stats FILE -o OUTPUT [OPTIONS]\n"
+              << R"HELP(
+libvc1 VC-1 / WMV9 encoder. Options are grouped below; use -i - to read a Y4M pipe.
+Pass 1 normally writes statistics only (no -o required). Pass 2 requires -o.
+
+INPUT AND OUTPUT
+  -i FILE|-                    Input Y4M file or stdin (default: -).
+  -o FILE                      Output video; extension selects container/codec.
+  --format MODE                auto|raw|m2ts|wmv|wvc1|mkv
+  --codec CODEC                auto|wvc1|wmv3 (Matroska only; vc1/wmv9 aliases).
+  --es-out FILE                Also save an elementary VC-1 stream.
+  --recon-out FILE             Write reconstructed YUV420 frames.
+  --debug-transforms FILE      Write transform overlay as Y4M.
+  --input-fps RATE             Override the Y4M frame rate (e.g. 24000/1001).
+  --max-frames N               Stop after N source frames.
+  --bluray-compat              Enforce Blu-ray VC-1 encoding restrictions.
+
+RATE CONTROL
+  --bitrate RATE               Average/whole-video target (38M default).
+  --max-bitrate RATE           Peak rate for VBV/HRD; Blu-ray passes 1 and 2 default to 40M.
+                               Non-Blu-ray pass 2 remains unrestricted.
+  --buffer-size BITS           VBV buffer (30M default); pass 2 uses it only for Blu-ray.
+  --rc-maximize                Favor fuller use of available bitrate.
+  --pass 1|2 --pass-stats FILE  Full first pass or stats-guided second pass.
+  --pass1-output               With -o FILE on pass 1, keep its video output.
+  --dynamic-ipb-weights        Adapt I/P/B weights in pass 2 (default: on).
+  --no-dynamic-ipb-weights     Keep the configured I/P/B baseline weights.
+  --dynamic-ipb-strength X     Adaptation strength, 0..2 (default: 1).
+  --i-block-weight X           Baseline intra-MB weight (default: 5.0).
+  --p-block-weight X           Baseline P-MB weight (default: 1.0).
+  --b-block-weight X           Baseline B-MB weight (default: 0.70).
+  --residual-priority-threshold X  Poor-prediction protection begins here (8).
+  --residual-priority-width X      Protection ramp width (24).
+  --residual-priority-strength X   Maximum Q boost (0, off by default).
+  --inter-intra-threshold X    P/B spatial-vs-temporal decision (default: 0.80).
+  --cq Q                       Constant quantizer instead of bitrate control.
+                               Q=1..31, or half steps 1.5..8.5.
+  --quantizer-type TYPE        auto|uniform|nonuniform
+  --no-halfqp                 Disable automatic HALFQP.
+
+GOP AND MOTION ESTIMATION
+  --keyint N                   Maximum keyframe interval (generic default: 120).
+  --bframes 0|1|2              Number of consecutive B pictures.
+  --intra-only                 Encode I pictures only.
+  --scene-cut / --no-scene-cut Enable/disable scene-cut detection (default: on).
+  --scene-threshold X          Scene-cut sensitivity threshold.
+  --scene-cut-interval SEC     Minimum time between scene-cut I pictures (0.25).
+  --fixed-gop-grid             Suppress unscheduled adaptive I pictures.
+  --search-range N             Maximum motion-search radius (default: 1024).
+  --local-search-range N       Local search radius (default: 32).
+  --me-quality MODE            sad|rate|satd|rd (default: satd).
+  --long-range-search MODE     compare|local-good|legacy (default: compare).
+  --distant-match-max-error X  Maximum distant-match luma MAE (default: 255).
+
+CODING TOOLS
+  --trellis 0|1|2              Trellis level; --no-trellis disables it.
+  --aq-strength X              AQ strength; --no-aq disables AQ.
+  --dquant / --no-dquant       Toggle macroblock quantizer adjustment.
+  --overlap|--no-overlap      Toggle overlap smoothing.
+  --no-loop-filter             Disable in-loop deblocking.
+  --no-fade-comp               Disable intensity/fade compensation.
+  --fixed-8x8                  Disable variable inter transforms.
+  --skip-identical-frames      Enable normative skipped pictures (default).
+  --no-skip-identical-frames   Disable skipped-picture optimization.
+  --dc-only                    Enable DC-only transform coding.
+  --ac-mode MODE               auto|vlc|esc3
+  --ac-y-table 0|1|2           Luma AC VLC table (requires --ac-mode vlc).
+  --ac-c-table 0|1|2           Chroma AC VLC table (requires --ac-mode vlc).
+
+PERFORMANCE AND COMPUTE
+  --fast / --faster / --fastest Select a speed preset; later options override it.
+  --threads N                  Number of encoding threads.
+  --intra-gop-parallelism      Enable extra work inside each GOP (off by default).
+  --no-intra-gop-parallelism   Disable intra-GOP work explicitly.
+  --compute cpu|vulkan         CPU by default; Vulkan is experimental, opt-in.
+  --compute-device N           Vulkan physical-device index.
+  --vulkan-min-batch N         Minimum Vulkan dispatch batch size.
+  --vulkan-force               Force eligible Vulkan work without speed win.
+  --simd TIER                  auto|none|x86-64-v1|prescott|k10|conroe|
+                               penryn|x86-64-v2|sandybridge|bulldozer|
+                               piledriver|avx2-partial|x86-64-v3|x86-64-v4
+  --benchmark-all              Benchmark all compatible SIMD tiers (default).
+  --benchmark-selective        Benchmark only selected intermediate tiers.
+  --simd-primitive NAME=TIER   Override one primitive (comma-separated or repeat).
+  --simd-fma                   Enable available SIMD FMA paths.
+
+DIAGNOSTICS
+  --rc-stats FILE              Write per-picture rate-control CSV.
+  --debug-stats FILE           Write extended decisions/quality CSV.
+  --macroblock-stats FILE      Write per-macroblock analysis CSV.
+  --speed-profile FILE         Write aggregate encoder timing report.
+  --debug-disable-p-intra      Isolate P-picture intra macroblocks.
+  --debug-disable-b-intra      Isolate B-picture intra macroblocks.
+  --debug-disable-pb-intra     Suppress both P- and B-picture intra MBs.
+  -h, --help                   Display this help.
+
+EXAMPLES
+  vc1enc -i input.y4m -o output.m2ts --bitrate 20M --bluray-compat --max-bitrate 40M
+  cat input.y4m | vc1enc -i - -o output.vc1 --format raw
+  cat input.y4m | vc1enc -i - --pass 1 --pass-stats encode.stats --bitrate 20M
+  cat input.y4m | vc1enc -i - --pass 2 --pass-stats encode.stats -o output.m2ts --bitrate 20M
+
+NOTES
+  Formats: .vc1 = raw Advanced Profile; .m2ts = Advanced Profile transport
+  stream; .wmv = WMV3/Main ASF; .mkv = Matroska/WVC1 by default. Other
+  extensions default to M2TS. MKV requires libmatroska and libebml at build time.
+  Y4M Ip/It/Ib input is supported; interlace requires Advanced Profile.
+  --bluray-compat changes codec constraints, not the output container.
+  Both two-pass invocations can independently read stdin; use the same source
+  and coding layout. Bitrates may differ between passes. Video bitrate is
+  planned globally, but exact file size is not guaranteed (quantization and
+  container overhead). Unless --bluray-compat is set, pass 2 has no artificial
+  peak, per-picture, GOP, or VBV limits, and does not signal HRD. Targets above
+  VC-1's profile/level rate limits can produce nonconformant streams. Dynamic
+  weights affect pass 2 only; both passes do
+  a full encode. No source lookahead or retained future GOPs are required.
+  I/P/B weights are relative and normalized over the GOP; intra MBs inside
+  P/B pictures use the I weight. --cq does not use bitrate/weight controls.
+  Aliases: --stats-file, --i-frame-weight, --p-frame-weight, --b-frame-weight,
+  --fps, --container, --mb-stats and --profile-speed remain supported.
+)HELP";
 }
 
 static void blend_overlay_rect(std::vector<uint8_t>& plane,int w,int h,int x0,int y0,int rw,int rh,int target) {
@@ -794,7 +895,8 @@ struct ReconRecord { Frame frame; std::vector<uint8_t> transform_map; int type=V
 
 int main(int argc,char** argv) {
     try {
-        std::string inpath="-",outpath,espath,reconpath,transformpath,rcstatspath,debugstatspath,macroblockstatspath,speedprofilepath,format="auto",codec="auto";
+        std::string inpath="-",outpath,espath,reconpath,transformpath,rcstatspath,debugstatspath,macroblockstatspath,speedprofilepath,passstatspath,format="auto",codec="auto";
+        bool pass1_output_flag=false;
         bool input_fps_override_set=false; Rational input_fps_override{};
         int64_t maxframes=std::numeric_limits<int64_t>::max();
         vc1_param_t param; vc1_param_default(&param);
@@ -841,7 +943,13 @@ int main(int argc,char** argv) {
             }
         };
         for(int i=1;i<argc;++i){ std::string a=argv[i]; auto need=[&](const char* o){if(++i>=argc)throw std::runtime_error(std::string("missing value for ")+o);return std::string(argv[i]);};
-            if(a=="-i")inpath=need("-i"); else if(a=="-o")outpath=need("-o"); else if(a=="--format"||a=="--container")format=need(a.c_str());
+            if(a=="-i")inpath=need("-i"); else if(a=="-o")outpath=need("-o");
+            else if(a=="--pass")param.i_two_pass=std::stoi(need("--pass"));
+            else if(a=="--pass-stats"||a=="--stats-file")passstatspath=need(a.c_str());
+            else if(a=="--pass1-output")pass1_output_flag=true;
+            else if(a=="--dynamic-ipb-weights")param.b_two_pass_dynamic_weights=1;
+            else if(a=="--no-dynamic-ipb-weights")param.b_two_pass_dynamic_weights=0;
+            else if(a=="--dynamic-ipb-strength")param.f_two_pass_dynamic_strength=std::stod(need(a.c_str())); else if(a=="--format"||a=="--container")format=need(a.c_str());
             else if(a=="--codec"){codec=need("--codec");codec_set=true;}
             else if(a=="--es-out")espath=need("--es-out"); else if(a=="--recon-out")reconpath=need("--recon-out"); else if(a=="--debug-transforms"||a=="--transform-overlay")transformpath=need(a.c_str()); else if(a=="--rc-stats")rcstatspath=need("--rc-stats"); else if(a=="--debug-stats")debugstatspath=need("--debug-stats"); else if(a=="--macroblock-stats"||a=="--mb-stats")macroblockstatspath=need(a.c_str()); else if(a=="--speed-profile"||a=="--profile-speed"){speedprofilepath=need(a.c_str());param.b_speed_profile=1;}
             else if(a=="--input-fps"||a=="--fps"){input_fps_override=parse_fps_value(need(a.c_str()),a.c_str());input_fps_override_set=true;}
@@ -858,7 +966,7 @@ int main(int argc,char** argv) {
             else if(a=="--no-simd")param.i_simd=VC1_SIMD_NONE; else if(a=="--simd-fma"||a=="--fma3")param.b_simd_fma=1; else if(a=="--no-simd-fma")param.b_simd_fma=0;
             else if(a=="--bframes")param.i_bframes=std::stoi(need("--bframes"));
             else if(a=="--bluray-compat")param.b_bluray_compat=1; else if(a=="--no-bluray-compat")param.b_bluray_compat=0;
-            else if(a=="--bitrate"){param.i_bitrate=parse_bitrate_value(need("--bitrate"),"--bitrate");bitrate_set=true;} else if(a=="--buffer-size"){param.i_vbv_buffer_size=parse_bitrate_value(need("--buffer-size"),"--buffer-size");buffer_set=true;} else if(a=="--rc-maximize"||a=="--maximize-bitrate"||a=="--max-utilization"){param.b_rc_maximize=1;rc_maximize_set=true;} else if(a=="--i-frame-weight"||a=="--i-block-weight"||a=="--rc-i-weight"){param.f_rc_i_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--p-frame-weight"||a=="--p-block-weight"||a=="--rc-p-weight"){param.f_rc_p_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--b-frame-weight"||a=="--b-block-weight"||a=="--rc-b-weight"){param.f_rc_b_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--residual-priority-threshold"||a=="--poor-prediction-threshold"){param.f_rc_residual_threshold=std::stod(need(a.c_str()));} else if(a=="--residual-priority-width"||a=="--poor-prediction-width"){param.f_rc_residual_width=std::stod(need(a.c_str()));} else if(a=="--residual-priority-strength"||a=="--poor-prediction-boost"){param.f_rc_residual_max_q_boost=std::stod(need(a.c_str()));} else if(a=="--inter-intra-threshold"||a=="--intra-block-threshold"){param.f_inter_intra_threshold=std::stod(need(a.c_str()));} else if(a=="--cq"||a=="--quantizer"){double q=std::stod(need(a.c_str())); double iq=std::floor(q); double frac=q-iq; if(q<1.0||q>31.0||!(std::abs(frac)<1e-9||std::abs(frac-0.5)<1e-9)|| (frac>0.25&&iq>8.0)) throw std::runtime_error("--cq must be an integer 1..31 or a half step 1.5..8.5"); param.i_qp_constant=static_cast<int>(iq); param.b_qp_half=frac>0.25?1:0; param.i_rc_method=VC1_RC_CQP;cq_set=true;} else if(a=="--quantizer-type"){std::string q=need("--quantizer-type"); if(q=="auto")param.i_quantizer_type=VC1_QUANTIZER_AUTO; else if(q=="uniform")param.i_quantizer_type=VC1_QUANTIZER_UNIFORM; else if(q=="nonuniform")param.i_quantizer_type=VC1_QUANTIZER_NONUNIFORM; else throw std::runtime_error("--quantizer-type must be auto, uniform, or nonuniform");} else if(a=="--no-halfqp"){param.b_halfqp=0;}
+            else if(a=="--max-bitrate"){param.i_peak_bitrate=parse_bitrate_value(need("--max-bitrate"),"--max-bitrate");} else if(a=="--bitrate"){param.i_bitrate=parse_bitrate_value(need("--bitrate"),"--bitrate");bitrate_set=true;} else if(a=="--buffer-size"){param.i_vbv_buffer_size=parse_bitrate_value(need("--buffer-size"),"--buffer-size");buffer_set=true;} else if(a=="--rc-maximize"||a=="--maximize-bitrate"||a=="--max-utilization"){param.b_rc_maximize=1;rc_maximize_set=true;} else if(a=="--i-frame-weight"||a=="--i-block-weight"||a=="--rc-i-weight"){param.f_rc_i_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--p-frame-weight"||a=="--p-block-weight"||a=="--rc-p-weight"){param.f_rc_p_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--b-frame-weight"||a=="--b-block-weight"||a=="--rc-b-weight"){param.f_rc_b_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--residual-priority-threshold"||a=="--poor-prediction-threshold"){param.f_rc_residual_threshold=std::stod(need(a.c_str()));} else if(a=="--residual-priority-width"||a=="--poor-prediction-width"){param.f_rc_residual_width=std::stod(need(a.c_str()));} else if(a=="--residual-priority-strength"||a=="--poor-prediction-boost"){param.f_rc_residual_max_q_boost=std::stod(need(a.c_str()));} else if(a=="--inter-intra-threshold"||a=="--intra-block-threshold"){param.f_inter_intra_threshold=std::stod(need(a.c_str()));} else if(a=="--cq"||a=="--quantizer"){double q=std::stod(need(a.c_str())); double iq=std::floor(q); double frac=q-iq; if(q<1.0||q>31.0||!(std::abs(frac)<1e-9||std::abs(frac-0.5)<1e-9)|| (frac>0.25&&iq>8.0)) throw std::runtime_error("--cq must be an integer 1..31 or a half step 1.5..8.5"); param.i_qp_constant=static_cast<int>(iq); param.b_qp_half=frac>0.25?1:0; param.i_rc_method=VC1_RC_CQP;cq_set=true;} else if(a=="--quantizer-type"){std::string q=need("--quantizer-type"); if(q=="auto")param.i_quantizer_type=VC1_QUANTIZER_AUTO; else if(q=="uniform")param.i_quantizer_type=VC1_QUANTIZER_UNIFORM; else if(q=="nonuniform")param.i_quantizer_type=VC1_QUANTIZER_NONUNIFORM; else throw std::runtime_error("--quantizer-type must be auto, uniform, or nonuniform");} else if(a=="--no-halfqp"){param.b_halfqp=0;}
             else if(a=="--keyint"){param.i_keyint_max=std::stoi(need("--keyint"));keyint_set=true;} else if(a=="--search-range")param.i_motion_search_range=std::stoi(need("--search-range")); else if(a=="--local-search-range"||a=="--local-search")param.i_motion_local_search_range=std::stoi(need(a.c_str()));
             else if(a=="--me-quality"||a=="--motion-quality"){auto v=need(a.c_str());if(v=="sad")param.i_me_quality=VC1_ME_SAD;else if(v=="rate"||v=="sad-rate")param.i_me_quality=VC1_ME_RATE;else if(v=="satd")param.i_me_quality=VC1_ME_SATD;else if(v=="rd"||v=="rdo")param.i_me_quality=VC1_ME_RD;else throw std::runtime_error("--me-quality must be sad, rate, satd, or rd");}
             else if(a=="--long-range-search"||a=="--distant-search-mode"){auto v=need(a.c_str());if(v=="compare"||v=="best")param.i_long_range_search_mode=VC1_LONG_RANGE_COMPARE;else if(v=="local-good"||v=="local-first")param.i_long_range_search_mode=VC1_LONG_RANGE_LOCAL_GOOD_SKIP;else if(v=="legacy"||v=="distant-first")param.i_long_range_search_mode=VC1_LONG_RANGE_LEGACY_DISTANT_FIRST;else throw std::runtime_error("--long-range-search must be compare, local-good, or legacy");}
@@ -870,7 +978,20 @@ int main(int argc,char** argv) {
             else if(a=="--ac-y-table"){param.i_ac_y_table=std::stoi(need("--ac-y-table"));y_table_set=true;} else if(a=="--ac-c-table"){param.i_ac_c_table=std::stoi(need("--ac-c-table"));c_table_set=true;} else if(a=="--ac-esc3-only")param.i_ac_mode=VC1_AC_ESC3;
             else if(a=="-h"||a=="--help"){usage(argv[0]);return 0;} else throw std::runtime_error("unknown option: "+a);
         }
-        if(outpath.empty()){usage(argv[0]);return 2;}
+        if(param.i_two_pass<0 || param.i_two_pass>2)
+            throw std::runtime_error("--pass must be 1 or 2 (or omit it for one-pass)");
+        if ((param.i_two_pass!=0 && passstatspath.empty()) || (param.i_two_pass==0 && !passstatspath.empty()))
+            throw std::runtime_error("--pass 1 or --pass 2 requires --pass-stats FILE");
+        if (pass1_output_flag && (param.i_two_pass!=1 || outpath.empty()))
+            throw std::runtime_error("--pass1-output requires --pass 1 and -o FILE");
+        const bool write_video=(param.i_two_pass!=1 || !outpath.empty());
+        if(outpath.empty() && param.i_two_pass!=1){usage(argv[0]);return 2;}
+        if(!write_video) outpath="libvc1-pass1-virtual.m2ts"; // format inference only; never opened
+        if(param.i_two_pass && (passstatspath==inpath || (write_video && passstatspath==outpath) ||
+            passstatspath==espath || passstatspath==reconpath || passstatspath==transformpath ||
+            passstatspath==rcstatspath || passstatspath==debugstatspath || passstatspath==macroblockstatspath ||
+            passstatspath==speedprofilepath))
+            throw std::runtime_error("two-pass statistics filename must not overwrite video/input/other reports");
         for(char& c:format)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         for(char& c:codec)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         if(format!="auto"&&format!="raw"&&format!="vc1"&&format!="elementary"&&format!="m2ts"&&format!="wmv"&&format!="wvc1"&&format!="asf-vc1"&&format!="mkv"&&format!="matroska")
@@ -897,7 +1018,7 @@ int main(int argc,char** argv) {
         // of carrying the Advanced default into an invalid Main stream.
         if (main_profile && !bitrate_set && !cq_set && param.i_rc_method==VC1_RC_ABR)
             param.i_bitrate=20000000ull;
-        if (mkv_output&&!libvc1_matroska_available())
+        if (write_video && mkv_output&&!libvc1_matroska_available())
             throw std::runtime_error("Matroska output was not built: install libmatroska and libebml development files, then rebuild libvc1");
         if (main_profile && !espath.empty())
             throw std::runtime_error("--es-out is unavailable for WMV9/WMV3 because its sequence header and frame boundaries are container-carried");
@@ -919,9 +1040,12 @@ int main(int argc,char** argv) {
         if(inpath=="-")_setmode(_fileno(stdin),_O_BINARY);
 #endif
         if(inpath!="-"){inf.open(inpath,std::ios::binary);if(!inf)throw std::runtime_error("cannot open input");in=&inf;}
+        param.psz_two_pass_stats_file=passstatspath.empty()?nullptr:passstatspath.c_str();
         Y4mReader y4m(*in);param.i_width=y4m.width();param.i_height=y4m.height();param.i_fps_num=static_cast<int>(y4m.fps().num);param.i_fps_den=static_cast<int>(y4m.fps().den);if(input_fps_override_set){param.i_fps_num=static_cast<int>(input_fps_override.num);param.i_fps_den=static_cast<int>(input_fps_override.den);}param.i_scan_mode=y4m.scan_mode();param.b_debug_stats=!debugstatspath.empty();param.b_debug_macroblock_stats=!macroblockstatspath.empty();param.b_recon=(!reconpath.empty()||!transformpath.empty()||!debugstatspath.empty()||!macroblockstatspath.empty());param.b_transform_info=!transformpath.empty();
         std::unique_ptr<vc1_t,void(*)(vc1_t*)> enc(vc1_encoder_open(&param),vc1_encoder_close); if(!enc)throw std::runtime_error(std::string("libvc1: ")+vc1_encoder_last_error(nullptr));
         vc1_param_t actual{};vc1_encoder_parameters(enc.get(),&actual); vc1_stats_t initial{};vc1_encoder_stats(enc.get(),&initial);
+        const uint64_t nominal_container_rate=(actual.i_two_pass==2 && !actual.b_bluray_compat)
+            ? actual.i_bitrate : initial.i_hrd_rate_bits;
         bool any_simd_override=false;for(int pi=0;pi<VC1_SIMD_PRIMITIVE_COUNT;++pi)if(param.i_simd_primitive[pi]!=VC1_SIMD_AUTO){any_simd_override=true;break;}
         if(param.i_simd==VC1_SIMD_AUTO){
             constexpr int kModeW=10, kPrimW=24, kRateW=16, kPctMinW=10, kSelectedW=18, kSelectedPctW=12;
@@ -1011,7 +1135,7 @@ int main(int argc,char** argv) {
             }
         }
         const uint64_t configured_keyint=actual.i_keyint_max>0?static_cast<uint64_t>(actual.i_keyint_max):(actual.b_bluray_compat?static_cast<uint64_t>(std::max(1LL,std::llround(static_cast<double>(actual.i_fps_num)/actual.i_fps_den))):120ull);
-        const char* output_name=raw_output?"VC-1 Advanced Profile elementary stream":(mkv_wmv3?"WMV9/WMV3 Main Profile MKV":(mkv_wvc1?"VC-1 Advanced Profile WVC1 MKV":(wmv3?"WMV9/WMV3 Main Profile ASF":(wvc1?"VC-1 Advanced Profile WVC1 ASF":"VC-1 Advanced Profile M2TS"))));
+        const char* output_name=!write_video?"statistics only (no video)":(raw_output?"VC-1 Advanced Profile elementary stream":(mkv_wmv3?"WMV9/WMV3 Main Profile MKV":(mkv_wvc1?"VC-1 Advanced Profile WVC1 MKV":(wmv3?"WMV9/WMV3 Main Profile ASF":(wvc1?"VC-1 Advanced Profile WVC1 ASF":"VC-1 Advanced Profile M2TS")))));
         const char* me_name=actual.i_me_quality==VC1_ME_RD?"rd":(actual.i_me_quality==VC1_ME_SATD?"satd":(actual.i_me_quality==VC1_ME_RATE?"rate":"sad"));
         const char* long_range_name=actual.i_long_range_search_mode==VC1_LONG_RANGE_LOCAL_GOOD_SKIP?"local-good":(actual.i_long_range_search_mode==VC1_LONG_RANGE_LEGACY_DISTANT_FIRST?"legacy":"compare");
         std::cerr<<"vc1enc: options: "<<actual.i_width<<"x"<<actual.i_height<<" @ "<<actual.i_fps_num<<"/"<<actual.i_fps_den<<" fps"
@@ -1039,10 +1163,24 @@ int main(int argc,char** argv) {
                      <<", halfqp="<<(actual.b_qp_half?"on":"off")
                      <<", quantizer-type="<<(actual.i_quantizer_type==VC1_QUANTIZER_NONUNIFORM?"nonuniform":(actual.i_quantizer_type==VC1_QUANTIZER_UNIFORM?"uniform":"auto"))<<"\n";
         } else {
-            std::cerr<<"vc1enc: rate control: rate-mode="<<(actual.b_rc_maximize?"abr-max":"abr")
-                     <<", ceiling="<<actual.i_bitrate<<" bps, buffer="<<actual.i_vbv_buffer_size<<" bits"
+            std::cerr<<"vc1enc: rate control: rate-mode="
+                     <<(actual.i_two_pass ? "2pass" : (actual.b_rc_maximize ? "abr-max" : "abr"));
+            if (actual.i_two_pass)
+                std::cerr<<", pass="<<actual.i_two_pass<<"/2";
+            std::cerr<<", target="<<actual.i_bitrate<<" bps";
+            if (actual.i_two_pass==2 && !actual.b_bluray_compat)
+                std::cerr<<", peak=unrestricted, VBV=disabled";
+            else
+                std::cerr<<", peak="<<initial.i_hrd_rate_bits<<" bps"
+                         <<", buffer="<<initial.i_hrd_buffer_bits<<" bits"
+                         <<(actual.i_two_pass==2?", Blu-ray VBV=enforced":"");
+            std::cerr
                      <<", weights=I:"<<actual.f_rc_i_weight<<"/P:"<<actual.f_rc_p_weight<<"/B:"<<actual.f_rc_b_weight<<"\n";
         }
+        if (actual.i_two_pass==2 && !actual.b_bluray_compat &&
+            actual.i_bitrate>(actual.i_profile==VC1_PROFILE_MAIN?20000000ull:135000000ull))
+            std::cerr<<"vc1enc: warning: two-pass target exceeds this VC-1 profile/level nominal rate; "
+                        "the resulting stream may not be standards-conformant or supported by all decoders.\n";
         if(initial.b_compute_benchmark_ran) {
             std::cerr<<"vc1enc: compute benchmark: vulkan["<<initial.i_compute_benchmark_device<<":"
                      <<initial.sz_compute_benchmark_device<<"]";
@@ -1081,16 +1219,16 @@ int main(int argc,char** argv) {
 
         vc1_au_t* headers=nullptr;int nheaders=0;if(vc1_encoder_headers(enc.get(),&headers,&nheaders)<0||nheaders!=1)throw std::runtime_error("libvc1 failed to return sequence header"); std::vector<uint8_t> sequence(headers->p_payload,headers->p_payload+headers->i_payload);
         std::ofstream outf;
-        if(!mkv_output){outf.open(outpath,std::ios::binary);if(!outf)throw std::runtime_error("cannot open output");}
+        if(write_video && !mkv_output){outf.open(outpath,std::ios::binary);if(!outf)throw std::runtime_error("cannot open output");}
         std::ofstream esf;if(!espath.empty()){esf.open(espath,std::ios::binary);if(!esf)throw std::runtime_error("cannot open ES output");}std::ofstream reconf;if(!reconpath.empty()){reconf.open(reconpath,std::ios::binary);if(!reconf)throw std::runtime_error("cannot open reconstruction output");}std::ofstream transformf;if(!transformpath.empty()){transformf.open(transformpath,std::ios::binary);if(!transformf)throw std::runtime_error("cannot open transform debug output");transformf<<"YUV4MPEG2 W"<<param.i_width<<" H"<<param.i_height<<" F"<<param.i_fps_num<<':'<<param.i_fps_den<<' '<<y4m.scan_tag()<<" A1:1 C420jpeg\n";}
-        std::ofstream rcstatsf;if(!rcstatspath.empty()){rcstatsf.open(rcstatspath);if(!rcstatsf)throw std::runtime_error("cannot open rate-control statistics output");rcstatsf<<"display_order,coded_order,type,keyframe,complexity,predicted_q,final_q,predicted_bits,first_actual_bits,final_actual_bits,target_bits,allowed_bits,prediction_error_percent,vbv_before_bits,vbv_after_bits,retries,reencoded\n"<<std::setprecision(12);}
+        std::ofstream rcstatsf;if(!rcstatspath.empty()){rcstatsf.open(rcstatspath);if(!rcstatsf)throw std::runtime_error("cannot open rate-control statistics output");rcstatsf<<"display_order,coded_order,type,keyframe,complexity,predicted_q,final_q,predicted_bits,first_actual_bits,final_actual_bits,target_bits,allowed_bits,prediction_error_percent,vbv_before_bits,vbv_after_bits,retries,reencoded,gop_index,two_pass_gop_scale,effective_i_weight,effective_p_weight,effective_b_weight\n"<<std::setprecision(12);}
         if(!debugstatspath.empty() && debugstatspath==rcstatspath) throw std::runtime_error("--debug-stats and --rc-stats must use different files");
         std::ofstream debugstatsf;if(!debugstatspath.empty()){debugstatsf.open(debugstatspath);if(!debugstatsf)throw std::runtime_error("cannot open debug statistics output");debugstatsf<<"display_order,coded_order,gop_index,frame_in_gop,gop_frames,type,keyframe,keyframe_reason,skipped_picture,pts,dts,timestamp_seconds,profile,rc_mode,threads,simd,search_range,local_search_range,bframes,trellis,aq_strength,loop_filter,variable_transforms,dquant,ac_mode,macroblocks_total,qp,halfqp,quantizer_type,quant_step,qscale,complexity,motion_residual,predicted_q,predicted_bits,first_actual_bits,final_actual_bits,target_bits,planned_bits,allowed_bits,prediction_error_percent,vbv_before_bits,vbv_after_bits,retries,reencoded,gop_budget_scale,gop_difficulty,encode_trials,moved_mb,fractional_chroma_mb,skipped_mb,explicit_mb,coded_mb,coded_blocks,p_four_mv_mb,p_intra_mb,dquant_mb,mquant_min,mquant_max,mquant_mean,transform_8x8,transform_8x4,transform_4x8,transform_4x4,ttmbf,ttfrm,ttfrm_exact_checked,acpred_mb,intensity_comp,b_forward,b_backward,b_interpolated,b_direct,mean_mv_pixels,max_mv_pixels,mse_y,mse_u,mse_v,mse_yuv,snr_y_db,snr_u_db,snr_v_db,snr_yuv_db,psnr_y_db,psnr_u_db,psnr_v_db,psnr_yuv_db,bits_per_pixel\n"<<std::setprecision(12);}
         if(!macroblockstatspath.empty() && (macroblockstatspath==debugstatspath || macroblockstatspath==rcstatspath)) throw std::runtime_error("--macroblock-stats must use a different file from --debug-stats/--rc-stats");
         std::ofstream macroblockstatsf;if(!macroblockstatspath.empty()){
             macroblockstatsf.open(macroblockstatspath);if(!macroblockstatsf)throw std::runtime_error("cannot open macroblock statistics output");
             const char* profile_name=actual.i_profile==VC1_PROFILE_MAIN?"main":"advanced";
-            const char* rc_name=actual.i_rc_method==VC1_RC_CQP?"cqp":(actual.b_rc_maximize?"abr-max":"abr");
+            const char* rc_name=actual.i_rc_method==VC1_RC_CQP?"cqp":(actual.i_two_pass?"2pass":(actual.b_rc_maximize?"abr-max":"abr"));
             macroblockstatsf<<std::setprecision(12)
                 <<"# format=libvc1-macroblock-stats-v2\n"
                 <<"# codec_version="<<vc1_version_str()<<"\n"
@@ -1120,19 +1258,19 @@ int main(int argc,char** argv) {
         std::unique_ptr<M2tsMuxer> m2ts;
         std::unique_ptr<AsfVideoMuxer> asf;
         std::unique_ptr<MatroskaVideoMuxer> mkv;
-        if(wmv3) {
+        if(write_video && wmv3) {
             if(sequence.size()!=4) throw std::runtime_error("WMV9 Main Profile sequence header must be exactly 4 bytes");
             asf=std::make_unique<AsfVideoMuxer>(outf,param.i_width,param.i_height,Rational{param.i_fps_num,param.i_fps_den},
-                std::array<uint8_t,4>{{'W','M','V','3'}},sequence,param.i_rc_method==VC1_RC_CQP?0:initial.i_hrd_rate_bits);
-        } else if(mkv_wmv3) {
+                std::array<uint8_t,4>{{'W','M','V','3'}},sequence,param.i_rc_method==VC1_RC_CQP?0:nominal_container_rate);
+        } else if(write_video && mkv_wmv3) {
             if(sequence.size()!=4) throw std::runtime_error("WMV9 Main Profile sequence header must be exactly 4 bytes");
             mkv=std::make_unique<MatroskaVideoMuxer>(outpath,param.i_width,param.i_height,param.i_width,param.i_height,param.i_fps_num,param.i_fps_den,
                 std::array<uint8_t,4>{{'W','M','V','3'}},sequence);
-        } else if(!raw_output&&!wvc1&&!mkv_output) m2ts=std::make_unique<M2tsMuxer>(outf);
+        } else if(write_video && !raw_output&&!wvc1&&!mkv_output) m2ts=std::make_unique<M2tsMuxer>(outf);
         uint64_t input_frames=0; const uint64_t limit=static_cast<uint64_t>(std::max<int64_t>(0,maxframes)); uint64_t expected_recon=0,expected_debug=0; std::map<uint64_t,ReconRecord> reconq; std::map<uint64_t,Frame> debug_source; std::map<uint64_t,std::string> debug_rows;
         auto process_output=[&](vc1_au_t* au,const vc1_picture_t& pic){
             if(!au)return;
-            if(rcstatsf.is_open()){const char t=au->i_type==VC1_TYPE_I?'I':(au->i_type==VC1_TYPE_B?'B':'P');rcstatsf<<au->i_display_order<<','<<au->i_coded_order<<','<<t<<','<<au->b_keyframe<<','<<au->f_rc_complexity<<','<<au->i_rc_predicted_q<<','<<au->i_qp<<','<<au->f_rc_predicted_bits<<','<<au->i_rc_first_actual_bits<<','<<(static_cast<uint64_t>(au->i_payload)*8ull)<<','<<au->f_rc_target_bits<<','<<au->f_rc_allowed_bits<<','<<au->f_rc_prediction_error_percent<<','<<au->f_rc_vbv_before_bits<<','<<au->f_rc_vbv_after_bits<<','<<au->i_rc_retries<<','<<au->b_rc_reencoded<<'\n';if(!rcstatsf)throw std::runtime_error("write failed on rate-control statistics output");}
+            if(rcstatsf.is_open()){const char t=au->i_type==VC1_TYPE_I?'I':(au->i_type==VC1_TYPE_B?'B':'P');rcstatsf<<au->i_display_order<<','<<au->i_coded_order<<','<<t<<','<<au->b_keyframe<<','<<au->f_rc_complexity<<','<<au->i_rc_predicted_q<<','<<au->i_qp<<','<<au->f_rc_predicted_bits<<','<<au->i_rc_first_actual_bits<<','<<(static_cast<uint64_t>(au->i_payload)*8ull)<<','<<au->f_rc_target_bits<<','<<au->f_rc_allowed_bits<<','<<au->f_rc_prediction_error_percent<<','<<au->f_rc_vbv_before_bits<<','<<au->f_rc_vbv_after_bits<<','<<au->i_rc_retries<<','<<au->b_rc_reencoded<<','<<au->i_debug_gop_index<<','<<au->f_two_pass_gop_scale<<','<<au->f_two_pass_i_weight<<','<<au->f_two_pass_p_weight<<','<<au->f_two_pass_b_weight<<'\n';if(!rcstatsf)throw std::runtime_error("write failed on rate-control statistics output");}
             if(macroblockstatsf.is_open()){
                 const char t=au->i_type==VC1_TYPE_I?'I':(au->i_type==VC1_TYPE_B?'B':'P');
                 auto mode_name=[](vc1_mb_debug_mode_e m){switch(m){case VC1_MB_DEBUG_I:return "I";case VC1_MB_DEBUG_P_INTER:return "P-inter";case VC1_MB_DEBUG_P_4MV:return "P-4mv";case VC1_MB_DEBUG_P_INTRA:return "P-intra";case VC1_MB_DEBUG_P_SKIPPED:return "P-skip";case VC1_MB_DEBUG_B_FORWARD:return "B-forward";case VC1_MB_DEBUG_B_BACKWARD:return "B-backward";case VC1_MB_DEBUG_B_INTERPOLATED:return "B-bi";case VC1_MB_DEBUG_B_DIRECT:return "B-direct";case VC1_MB_DEBUG_B_INTRA:return "B-intra";case VC1_MB_DEBUG_BI_INTRA:return "BI-intra";case VC1_MB_DEBUG_FIELD_P_FORWARD:return "field-P-forward";case VC1_MB_DEBUG_FIELD_B_FORWARD:return "field-B-forward";case VC1_MB_DEBUG_FIELD_B_BACKWARD:return "field-B-backward";default:return "unknown";}};
@@ -1142,6 +1280,7 @@ int main(int argc,char** argv) {
                 for(size_t mi=0;mi<au->i_debug_macroblocks;++mi){const auto& d=au->p_debug_macroblocks[mi];macroblockstatsf<<"mb";for(int z=0;z<11;++z)macroblockstatsf<<',';macroblockstatsf<<d.i_mb_x<<','<<d.i_mb_y<<','<<d.i_visible_width<<','<<d.i_visible_height<<','<<mode_name(d.i_mode)<<','<<d.i_field_index<<','<<d.i_field_parity<<','<<d.b_opposite_field_reference<<','<<d.b_skipped<<','<<d.b_intra<<','<<d.b_four_mv<<','<<d.b_direct<<','<<d.b_acpred<<','<<d.i_mquant<<','<<d.i_dquant_delta<<','<<d.i_cbp<<','<<d.i_coded_blocks<<','<<d.i_local_bits<<','<<d.f_amortized_frame_bits<<','<<d.i_estimated_transform_bits<<','<<d.i_transform_parts[0]<<','<<d.i_transform_parts[1]<<','<<d.i_transform_parts[2]<<','<<d.i_transform_parts[3]<<','<<d.i_forward_mv_count<<','<<d.i_forward_reference_display_order<<','<<d.i_forward_mv_xq[0]<<','<<d.i_forward_mv_yq[0]<<','<<d.i_forward_mv_xq[1]<<','<<d.i_forward_mv_yq[1]<<','<<d.i_forward_mv_xq[2]<<','<<d.i_forward_mv_yq[2]<<','<<d.i_forward_mv_xq[3]<<','<<d.i_forward_mv_yq[3]<<','<<d.i_backward_mv_count<<','<<d.i_backward_reference_display_order<<','<<d.i_backward_mv_xq[0]<<','<<d.i_backward_mv_yq[0]<<','<<d.i_backward_mv_xq[1]<<','<<d.i_backward_mv_yq[1]<<','<<d.i_backward_mv_xq[2]<<','<<d.i_backward_mv_yq[2]<<','<<d.i_backward_mv_xq[3]<<','<<d.i_backward_mv_yq[3]<<','<<d.f_mean_y<<','<<d.f_stddev_y<<','<<d.f_mean_u<<','<<d.f_mean_v<<','<<d.f_activity_y<<','<<d.f_previous_sad_y<<','<<d.f_previous_mse_y<<','<<d.f_prediction_sad_y<<','<<d.f_prediction_mse_y<<','<<d.f_prediction_mae_y<<','<<d.f_prediction_gain_db<<','<<d.f_residual_priority_position<<','<<d.f_residual_priority_requested_q_boost<<','<<d.i_residual_priority_applied_q_boost<<','<<d.f_inter_intra_cost_ratio<<','<<d.f_forward_distant_local_mae_y<<','<<d.f_forward_distant_candidate_mae_y<<','<<distant_name(d.i_forward_distant_match_decision)<<','<<d.f_backward_distant_local_mae_y<<','<<d.f_backward_distant_candidate_mae_y<<','<<distant_name(d.i_backward_distant_match_decision)<<','<<d.f_aq_dark_detail<<','<<d.f_aq_color_luma_priority<<','<<d.f_aq_color_chroma_priority<<','<<d.f_aq_requested_q_boost<<','<<d.f_recon_mse_y<<','<<d.f_recon_mse_u<<','<<d.f_recon_mse_v<<','<<d.f_recon_mse_yuv<<','<<d.f_recon_snr_y_db<<','<<d.f_recon_psnr_y_db<<','<<d.f_recon_snr_yuv_db<<','<<d.f_recon_psnr_yuv_db<<'\n';}
                 if(!macroblockstatsf)throw std::runtime_error("write failed on macroblock statistics output");
             }
+            if(write_video) {
             constexpr uint64_t initial90=9000;
             const uint64_t reorder=(param.b_intra_only||param.i_bframes==0)?0ull:1ull;
             const uint64_t pts90=initial90+((au->i_display_order+reorder)*90000ull*param.i_fps_den)/param.i_fps_num;
@@ -1155,7 +1294,7 @@ int main(int argc,char** argv) {
                 const uint64_t dtsms=(au->i_coded_order*1000ull*param.i_fps_den)/param.i_fps_num;
                 if(wvc1&&!asf){
                     auto first=prepare_wvc1_first_access_unit(payload,!param.b_intra_only&&param.i_bframes>0,param.i_scan_mode!=VC1_SCAN_PROGRESSIVE);
-                    asf=std::make_unique<AsfVideoMuxer>(outf,coded_width,coded_height,Rational{param.i_fps_num,param.i_fps_den},std::array<uint8_t,4>{{'W','V','C','1'}},first.codec_private,param.i_rc_method==VC1_RC_CQP?0:initial.i_hrd_rate_bits);
+                    asf=std::make_unique<AsfVideoMuxer>(outf,coded_width,coded_height,Rational{param.i_fps_num,param.i_fps_den},std::array<uint8_t,4>{{'W','V','C','1'}},first.codec_private,param.i_rc_method==VC1_RC_CQP?0:nominal_container_rate);
                     payload=std::move(first.frame_payload);
                 }
                 asf->write_video_frame(payload,ptsms,dtsms,au->b_keyframe!=0);
@@ -1169,6 +1308,7 @@ int main(int argc,char** argv) {
                 mkv->write_video_frame(payload,dtsns,au->b_keyframe!=0);
             } else {
                 m2ts->write_video_access_unit(payload,pts90,dts90,au->b_keyframe!=0);
+            }
             }
             if(esf.is_open()){
                 esf.write(reinterpret_cast<const char*>(au->p_payload),static_cast<std::streamsize>(au->i_payload));
@@ -1192,7 +1332,7 @@ int main(int argc,char** argv) {
                     const double bpp=static_cast<double>(final_bits)/std::max(1,param.i_width*param.i_height);
                     const double timestamp=static_cast<double>(au->i_display_order)*param.i_fps_den/param.i_fps_num;
                     const char* profile_name=actual.i_profile==VC1_PROFILE_MAIN?"main":"advanced";
-                    const char* rc_name=actual.i_rc_method==VC1_RC_CQP?"cqp":(actual.b_rc_maximize?"abr-max":"abr");
+                    const char* rc_name=actual.i_rc_method==VC1_RC_CQP?"cqp":(actual.i_two_pass?"2pass":(actual.b_rc_maximize?"abr-max":"abr"));
                     const char* ac_name=actual.i_ac_mode==VC1_AC_ESC3?"esc3":(actual.i_ac_mode==VC1_AC_VLC?"vlc":"auto");
                     const uint64_t mb_total=static_cast<uint64_t>((param.i_width+15)/16)*static_cast<uint64_t>((param.i_height+15)/16);
                     std::ostringstream row; row<<std::setprecision(12)
@@ -1207,6 +1347,11 @@ int main(int argc,char** argv) {
         };
         Frame f;while(input_frames<limit&&y4m.read(f)){if(debugstatsf.is_open())debug_source.emplace(input_frames,f);vc1_picture_t inpic;vc1_picture_init(&inpic);inpic.i_pts=static_cast<int64_t>(input_frames);inpic.img.i_plane=3;inpic.img.plane[0]=f.y.data();inpic.img.plane[1]=f.u.data();inpic.img.plane[2]=f.v.data();inpic.img.i_stride[0]=param.i_width;inpic.img.i_stride[1]=(param.i_width+1)/2;inpic.img.i_stride[2]=(param.i_width+1)/2;vc1_au_t* au=nullptr;int nau=0;vc1_picture_t outpic;if(vc1_encoder_encode(enc.get(),&au,&nau,&outpic,&inpic)<0)throw std::runtime_error(vc1_encoder_last_error(enc.get()));if(nau)process_output(au,outpic);++input_frames;f=Frame{};}
         while(vc1_encoder_delayed_frames(enc.get())>0){vc1_au_t* au=nullptr;int nau=0;vc1_picture_t outpic;if(vc1_encoder_encode(enc.get(),&au,&nau,&outpic,nullptr)<0)throw std::runtime_error(vc1_encoder_last_error(enc.get()));if(nau)process_output(au,outpic);else if(vc1_encoder_delayed_frames(enc.get())>0)throw std::runtime_error("libvc1 flush made no progress");}
+        if(param.i_two_pass==1){vc1_au_t* au=nullptr;int nau=0;vc1_picture_t outpic;
+            if(vc1_encoder_encode(enc.get(),&au,&nau,&outpic,nullptr)<0)
+                throw std::runtime_error(vc1_encoder_last_error(enc.get()));
+            if(nau)process_output(au,outpic);
+        }
         if (debugstatsf.is_open() && (!debug_source.empty() || !debug_rows.empty() || expected_debug!=input_frames))
             throw std::runtime_error("debug statistics did not receive exactly one row per input frame");
         if (input_frames==0)

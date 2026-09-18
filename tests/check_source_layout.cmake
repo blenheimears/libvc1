@@ -4,7 +4,7 @@ if(NOT DEFINED SRC)
   message(FATAL_ERROR "SRC required")
 endif()
 set(parts
-  encoder_core.cpp encoder_api_helpers.cpp encoder_internal.h encoder_encode.cpp encoder_motion.cpp
+  encoder_core.cpp encoder_two_pass.cpp encoder_two_pass.h encoder_bluray_constraints.cpp encoder_bluray_constraints.h encoder_api_helpers.cpp encoder_internal.h encoder_encode.cpp encoder_motion.cpp
   encoder_motion_compensation.cpp encoder_transform.cpp encoder_aq.cpp
   encoder_entropy.cpp encoder_filter.cpp encoder_compute.cpp encoder_simd.cpp encoder_rate_control.cpp encoder_bitstream.cpp)
 foreach(part IN LISTS parts)
@@ -57,3 +57,33 @@ foreach(required_text "Opteron_G4" "Opteron_G5" "xop=on" "fma4=on" "Nehalem" "Ha
   endif()
 endforeach()
 message(STATUS "QEMU SIMD test runner is opt-in, target-constrained, and FMA4-explicit")
+
+# Internal module boundaries: substantial executable implementations must not
+# be textually included from a header (or bypass the build-system source list).
+file(READ "${SRC}/src/encoder_two_pass.h" _two_pass_header)
+file(READ "${SRC}/src/encoder_bluray_constraints.h" _bluray_header)
+file(READ "${SRC}/CMakeLists.txt" _sources)
+foreach(_implementation "inline Plan read_plan" "inline uint64_t source_hash" "inline double plane_mse" "BudgetLedger(const Plan& plan,uint64_t bitrate,int fps_num,int fps_den) {")
+  string(FIND "${_two_pass_header}" "${_implementation}" _bad)
+  if(NOT _bad EQUAL -1)
+    message(FATAL_ERROR "two-pass implementation has returned to its header: ${_implementation}")
+  endif()
+endforeach()
+string(FIND "${_bluray_header}" "static void validate_bluray_compat" _bad_bluray)
+if(NOT _bad_bluray EQUAL -1)
+  message(FATAL_ERROR "Blu-ray validation implementation has returned to its header")
+endif()
+foreach(_unit "src/encoder_two_pass.cpp" "src/encoder_bluray_constraints.cpp")
+  string(FIND "${_sources}" "${_unit}" _listed)
+  if(_listed EQUAL -1)
+    message(FATAL_ERROR "missing compiled implementation: ${_unit}")
+  endif()
+endforeach()
+
+file(READ "${SRC}/src/encoder_internal.h" _internal_header)
+foreach(_old_body "inline std::vector<uint8_t> escape_ebdu" "inline std::vector<uint8_t> bdu" "void append(const BitWriter& other) {" "std::vector<uint8_t> finish_rbdu() {")
+  string(FIND "${_internal_header}" "${_old_body}" _bad)
+  if(NOT _bad EQUAL -1)
+    message(FATAL_ERROR "byte-stream implementation has returned to common header: ${_old_body}")
+  endif()
+endforeach()

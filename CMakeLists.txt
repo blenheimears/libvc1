@@ -78,6 +78,8 @@ endif()
 
 set(LIBVC1_COMMON_SOURCES
     src/encoder_core.cpp
+    src/encoder_two_pass.cpp
+    src/encoder_bluray_constraints.cpp
     src/encoder_api_helpers.cpp
     src/encoder_bitstream.cpp
     src/encoder_encode.cpp
@@ -733,16 +735,6 @@ if (LIBVC1_BUILD_TESTS)
     endif()
     add_test(NAME libvc1-interlaced-field-reference-runtime COMMAND libvc1_interlaced_field_refs)
 
-    add_executable(libvc1_modern_lookahead tests/modern_lookahead.cpp)
-    target_compile_features(libvc1_modern_lookahead PRIVATE cxx_std_17)
-    target_include_directories(libvc1_modern_lookahead PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    if (TARGET vc1_static)
-        target_link_libraries(libvc1_modern_lookahead PRIVATE vc1_static)
-    else()
-        target_link_libraries(libvc1_modern_lookahead PRIVATE vc1)
-    endif()
-    add_test(NAME libvc1-modern-lookahead COMMAND libvc1_modern_lookahead)
-
     add_executable(libvc1_intra_ac_prediction tests/intra_ac_prediction.cpp)
     target_compile_features(libvc1_intra_ac_prediction PRIVATE cxx_std_17)
     target_include_directories(libvc1_intra_ac_prediction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -752,6 +744,11 @@ if (LIBVC1_BUILD_TESTS)
         target_link_libraries(libvc1_intra_ac_prediction PRIVATE vc1)
     endif()
     add_test(NAME libvc1-intra-ac-prediction COMMAND libvc1_intra_ac_prediction)
+
+    add_executable(libvc1_two_pass_planner tests/two_pass_planner.cpp src/encoder_two_pass.cpp)
+    target_compile_features(libvc1_two_pass_planner PRIVATE cxx_std_17)
+    target_include_directories(libvc1_two_pass_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME libvc1-two-pass-planner COMMAND libvc1_two_pass_planner)
 
     add_test(NAME libvc1-debug-statistics
         COMMAND ${CMAKE_COMMAND}
@@ -770,6 +767,13 @@ if (LIBVC1_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug_stats_cli.py $<TARGET_FILE:vc1enc>)
         add_test(NAME libvc1-frame-weight-runtime
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/frame_weight_runtime.py $<TARGET_FILE:vc1enc>)
+        add_test(NAME libvc1-two-pass-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/two_pass_runtime.py $<TARGET_FILE:vc1enc>)
+        add_test(NAME libvc1-bluray-two-pass-peak-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/bluray_two_pass_peak_runtime.py
+                    $<TARGET_FILE:vc1enc>)
+        add_test(NAME libvc1-frontend-text-only
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/frontend_text_only_runtime.py $<TARGET_FILE:vc1enc>)
         add_test(NAME libvc1-residual-priority-runtime
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/residual_priority_runtime.py $<TARGET_FILE:vc1enc>)
         add_test(NAME libvc1-macroblock-statistics-cli

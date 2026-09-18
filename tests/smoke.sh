@@ -911,6 +911,9 @@ smoke_section '0.1.7 low-PQ / periodic-I quality regressions'
 # default-rate 38 Mbit/s path with an explicit historical 24-frame cadence,
 # which keeps I/P at PQ1 while the 0.1.41
 # reference-priority policy deliberately puts disposable B pictures at PQ2.
+# HRD peak and buffer are represented in discrete VC-1 header units, so
+# the diagnostic reports the represented 37,999,616/29,999,616 values,
+# not the requested 38,000,000/30,000,000 values.
 # Require every frame -- especially frames 1 and 25 -- to stay visually clean.
 "$FFMPEG" -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x240:rate=24 \
   -frames:v 26 -pix_fmt yuv420p -f yuv4mpegpipe -y "$TMP/keyquality.y4m"
@@ -918,7 +921,7 @@ smoke_section '0.1.7 low-PQ / periodic-I quality regressions'
   --no-scene-cut --search-range 4 --keyint 24 2>"$TMP/keyquality.log"
 grep -Eq '^encoded .*I=2, P=9, B=15, scene-I=0.*hrd-rate=37999616 bps, hrd-buffer=29999616 bits.*hrd-underflows=0.*q=1\.\.2' "$TMP/keyquality.log"
 grep -Fq 'keyint=24, gop-grid=scene-reset, bframes=2' "$TMP/keyquality.log"
-grep -Fq 'vc1enc: rate control: rate-mode=abr, ceiling=38000000 bps, buffer=30000000 bits' "$TMP/keyquality.log"
+grep -Fq 'vc1enc: rate control: rate-mode=abr, target=38000000 bps, peak=37999616 bps, buffer=29999616 bits' "$TMP/keyquality.log"
 "$FFMPEG" -hide_banner -loglevel error -i "$TMP/keyquality.y4m" -frames:v 26 \
   -pix_fmt yuv420p -f rawvideo -y "$TMP/keyquality-src.yuv"
 "$FFMPEG" -hide_banner -v error -xerror -err_detect explode -f vc1 -i "$TMP/keyquality.vc1" \
@@ -996,11 +999,11 @@ cmp "$TMP/noaq.vc1" "$TMP/aq0.vc1"
 cmp "$TMP/noaq-recon.yuv" "$TMP/aq0-recon.yuv"
 grep -Fq 'keyint=30, gop-grid=fixed, bframes=2' "$TMP/aq.log"
 grep -Fq 'aq=1.000000' "$TMP/aq.log"
-grep -Eq '^vc1enc: rate control: rate-mode=abr, ceiling=' "$TMP/aq.log"
+grep -Eq '^vc1enc: rate control: rate-mode=abr, target=' "$TMP/aq.log"
 grep -Eq '^encoded .*hrd-underflows=0' "$TMP/aq.log"
 grep -Fq 'keyint=30, gop-grid=fixed, bframes=2' "$TMP/noaq.log"
 grep -Fq 'aq=off' "$TMP/noaq.log"
-grep -Eq '^vc1enc: rate control: rate-mode=abr, ceiling=' "$TMP/noaq.log"
+grep -Eq '^vc1enc: rate control: rate-mode=abr, target=' "$TMP/noaq.log"
 grep -Eq '^encoded .*hrd-underflows=0' "$TMP/noaq.log"
 
 "$FFMPEG" -hide_banner -v error -xerror -err_detect explode -f vc1 -i "$TMP/aq.vc1" \
@@ -1128,7 +1131,7 @@ check_rc() {
     --bitrate "$target" --search-range 0 --no-scene-cut --keyint 999 2>"$TMP/rc-$tag.log"
   "$FFMPEG" -hide_banner -v error -xerror -err_detect explode -f vc1 -i "$TMP/rc-$tag.vc1" \
     -frames:v 12 -f null -
-  grep -Eq '^vc1enc: rate control: rate-mode=abr, ceiling=' "$TMP/rc-$tag.log"
+  grep -Eq '^vc1enc: rate control: rate-mode=abr, target=' "$TMP/rc-$tag.log"
   grep -Eq '^encoded .*hrd-rate=[0-9]+ bps, hrd-buffer=29999616 bits.*hrd-underflows=0' "$TMP/rc-$tag.log"
   maxpre=$(sed -n 's/.*hrd-max-pre=\([0-9][0-9]*\) bits.*/\1/p' "$TMP/rc-$tag.log" | tail -n 1)
   [[ -n "$maxpre" ]]
@@ -1146,9 +1149,10 @@ check_rc 10M 10m
 check_rc 20M 20m
 check_rc 38M 38m
 
-# The no-option default is the one-pass ABR+VBV controller with a 38 Mbit/s target/ceiling and 30 Mbit VBV.
+# The no-option default is one-pass ABR+VBV with a 38 Mbit/s nominal target and
+# the corresponding representable HRD rate and buffer (37,999,616/29,999,616).
 "$ENCODER" -i "$TMP/rc1080.y4m" -o "$TMP/rc-default.m2ts" --max-frames 12 --search-range 0 --no-scene-cut --keyint 999 2>"$TMP/rc-default.log"
-grep -Fq 'vc1enc: rate control: rate-mode=abr, ceiling=38000000 bps, buffer=30000000 bits' "$TMP/rc-default.log"
+grep -Fq 'vc1enc: rate control: rate-mode=abr, target=38000000 bps, peak=37999616 bps, buffer=29999616 bits' "$TMP/rc-default.log"
 grep -Eq '^encoded .*hrd-rate=37999616 bps, hrd-buffer=29999616 bits.*hrd-underflows=0' "$TMP/rc-default.log"
 
 "$ENCODER" -i "$TMP/flat.y4m" -o "$TMP/rc-stats.m2ts" --max-frames 4 --search-range 0 --no-scene-cut --rc-stats "$TMP/rc-stats.csv" >/dev/null 2>&1
@@ -1179,7 +1183,7 @@ PYDEBUGSTATS
 
 # Maximum-utilization mode biases the ABR qscale toward fuller nominal bitrate use while keeping the same hard serialized VBV.
 "$ENCODER" -i "$TMP/rc1080.y4m" -o "$TMP/rc-maximize.m2ts" --max-frames 12 --search-range 0 --no-scene-cut --keyint 999 --rc-maximize 2>"$TMP/rc-maximize.log"
-grep -Fq 'vc1enc: rate control: rate-mode=abr-max, ceiling=38000000 bps, buffer=30000000 bits' "$TMP/rc-maximize.log"
+grep -Fq 'vc1enc: rate control: rate-mode=abr-max, target=38000000 bps, peak=37999616 bps, buffer=29999616 bits' "$TMP/rc-maximize.log"
 grep -Eq '^encoded .*hrd-rate=37999616 bps, hrd-buffer=29999616 bits.*hrd-underflows=0' "$TMP/rc-maximize.log"
 
 # One flat GOP followed by two hard checker/motion GOPs provides a severe
@@ -1211,7 +1215,7 @@ for th in 1 4; do
     --keyint 24 --threads "$th" --search-range 0 --no-scene-cut \
     --no-skip-identical-frames --no-intra-gop-parallelism --rc-stats "$TMP/abr-recovery-$th.csv" \
     2>"$TMP/abr-recovery-$th.log"
-  grep -Fq 'vc1enc: rate control: rate-mode=abr, ceiling=1000000 bps, buffer=8000000 bits' "$TMP/abr-recovery-$th.log"
+  grep -Fq 'vc1enc: rate control: rate-mode=abr, target=1000000 bps, peak=1000000 bps, buffer=8000000 bits' "$TMP/abr-recovery-$th.log"
   grep -Eq '^encoded .*hrd-rate=1000000 bps, hrd-buffer=8000000 bits.*hrd-underflows=0' "$TMP/abr-recovery-$th.log"
   python3 - "$TMP/abr-recovery-$th.csv" <<'PYABRRC'
 import csv,sys
@@ -1323,7 +1327,7 @@ for g in range(6):
             raise SystemExit(f'abr GOP {g} B@{d} finer than surrounding qscale midpoint: B={bq}, refs={past[-1]}/{future[0]}, midpoint={refq}')
 if sum(int(x['retries']) for x in r): raise SystemExit('abr GOP-balance regression unexpectedly retried')
 PYABRBAL
-grep -Eq '^vc1enc: rate control: rate-mode=abr, ceiling=' "$TMP/abr-gop-balance.log"
+grep -Eq '^vc1enc: rate control: rate-mode=abr, target=' "$TMP/abr-gop-balance.log"
 grep -Eq '^encoded .*hrd-underflows=0' "$TMP/abr-gop-balance.log"
 
 # 0.1.46: zooming fine texture exercises the B-picture residual-allocation
@@ -1377,7 +1381,7 @@ total=sum(int(x['final_actual_bits']) for x in r)
 if not (570000 <= total <= 630000):
     raise SystemExit(f'B-texture total-rate regression: {total} bits')
 PYABRBTEX
-grep -Eq '^vc1enc: rate control: rate-mode=abr, ceiling=' "$TMP/abr-b-texture.log"
+grep -Eq '^vc1enc: rate control: rate-mode=abr, target=' "$TMP/abr-b-texture.log"
 grep -Eq '^encoded .*hrd-underflows=0' "$TMP/abr-b-texture.log"
 "$FFMPEG" -hide_banner -v error -xerror -err_detect explode -f vc1 -i "$TMP/abr-b-texture.vc1" -frames:v 48 -f null -
 
@@ -1419,7 +1423,7 @@ if int(p['final_q']) > 12:
 if int(i['retries']) > 1:
     raise SystemExit(f'hires-I overspend repair retried too many times: {i["retries"]}')
 PYABRHICHECK
-grep -Eq '^vc1enc: rate control: rate-mode=abr, ceiling=' "$TMP/abr-hires-i.log"
+grep -Eq '^vc1enc: rate control: rate-mode=abr, target=' "$TMP/abr-hires-i.log"
 grep -Eq '^encoded .*hrd-underflows=0' "$TMP/abr-hires-i.log"
 
 # 0.1.43: a deliberately expensive refresh I must not be charged as if it had
@@ -1458,7 +1462,7 @@ if p[0] > 10: raise SystemExit(f'post-I P starvation regression: first P PQ{p[0]
 if max(b[:2]) > 20: raise SystemExit(f'post-I B starvation regression: first B pair {b[:2]} exceeds PQ20')
 if sum(int(x['retries']) for x in g): raise SystemExit('post-I regression unexpectedly retried')
 PYABRPOSTI
-grep -Eq '^vc1enc: rate control: rate-mode=abr, ceiling=' "$TMP/abr-post-i.log"
+grep -Eq '^vc1enc: rate control: rate-mode=abr, target=' "$TMP/abr-post-i.log"
 grep -Eq '^encoded .*hrd-underflows=0' "$TMP/abr-post-i.log"
 
 # CQ holds one quantizer and disables HRD signaling.

@@ -20,11 +20,11 @@
 extern "C" {
 #endif
 
-#define LIBVC1_API_VERSION 39
+#define LIBVC1_API_VERSION 41
 #define LIBVC1_VERSION_MAJOR 0
 #define LIBVC1_VERSION_MINOR 2
-#define LIBVC1_VERSION_PATCH 35
-#define LIBVC1_VERSION_STRING "0.2.35"
+#define LIBVC1_VERSION_PATCH 48
+#define LIBVC1_VERSION_STRING "0.2.48"
 
 typedef struct vc1_t vc1_t;
 
@@ -386,6 +386,21 @@ typedef struct vc1_param_t {
        the header is repeated at every I-picture random-access entry point. */
     int b_emit_sequence_header;
 
+    /* API v40: independent full-encode statistics passes. i_two_pass=0,1,2.
+     * A nonempty stats filename is required for modes 1 and 2. The path is
+     * copied/consumed by vc1_encoder_open and need only remain valid there.
+     * Second-pass class adaptation can be disabled independently of two-pass
+     * global and per-picture allocation. */
+    int i_two_pass;
+    const char *psz_two_pass_stats_file;
+    int b_two_pass_dynamic_weights;
+    double f_two_pass_dynamic_strength;
+    /* API v41: independent peak transmission rate (bits/s), distinct from
+     * i_bitrate (the average/whole-film target) and i_vbv_buffer_size.
+     * Zero means automatic: 40 Mbit/s for Blu-ray second pass, i_bitrate
+     * for all other VBV-controlled encodes. Non-Blu-ray second pass remains
+     * unrestricted and rejects an explicit peak rather than ignoring it. */
+    uint64_t i_peak_bitrate;
     void *opaque;
 } vc1_param_t;
 
@@ -500,6 +515,11 @@ typedef struct vc1_au_t {
        until the next vc1_encoder_encode() call, like p_payload. */
     const vc1_mb_debug_t *p_debug_macroblocks;
     size_t i_debug_macroblocks;
+    /* API v40: lightweight two-pass allocation diagnostics (zero in one-pass). */
+    double f_two_pass_gop_scale;
+    double f_two_pass_i_weight;
+    double f_two_pass_p_weight;
+    double f_two_pass_b_weight;
 } vc1_au_t;
 
 typedef struct vc1_stats_t {

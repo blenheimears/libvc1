@@ -1,4 +1,6 @@
 #include "encoder_internal.h"
+#include "encoder_two_pass.h"
+#include "encoder_bluray_constraints.h"
 namespace libvc1 {
 using MotionVector = Vc1Encoder::MotionVector;
 using ProgressiveMvMode = Vc1Encoder::ProgressiveMvMode;
@@ -83,11 +85,13 @@ struct GopEncodeParams {
     bool intra_only=false;
     int bframes=2;
     uint64_t hrd_rate_bits=0;
+    uint64_t target_rate_bits=0; // average ABR target, independent of peak HRD transmission
     uint64_t hrd_buffer_bits=0;
-    // The libvc1 ABR lookahead does not impose a hard GOP ceiling.  It only
+    // The libvc1 ABR controller does not impose a hard GOP ceiling.  It only
     // biases this GOP's nominal ABR target so easy GOPs can leave reservoir for
     // a short difficult GOP in the same planning window.
     double modern_budget_scale=1.0;
+    std::vector<double> two_pass_picture_scale;
     // Relative intra/P-inter/B-inter ABR block weights. Normalized over the analyzed GOP block mix.
     double rc_i_weight=5.0;
     double rc_p_weight=1.0;
@@ -100,6 +104,7 @@ struct GopEncodeParams {
     // Debug-only temporal predecessor retained across GOP boundaries.
     std::shared_ptr<const libvc1::Frame> previous_source;
     double modern_difficulty=0.0;
+    int two_pass_mode=0;
     uint64_t modern_nominal_gop_bits=0;
     uint64_t modern_target_gop_bits=0;
 };
@@ -117,6 +122,9 @@ struct EncodedGopPicture {
     double quant_step=18.0;
     // libvc1 ABR rate-control diagnostics, copied to vc1_au_t for applications/--rc-stats.
     double rc_complexity=0.0;
+    double pass1_mse_y=0.0,pass1_mse_uv=0.0;
+    double two_pass_budget_scale=1.0;
+    double two_pass_i_weight=0.0,two_pass_p_weight=0.0,two_pass_b_weight=0.0;
     double rc_predicted_bits=0.0;
     double rc_target_bits=0.0;
     double rc_allowed_bits=0.0;
@@ -185,70 +193,6 @@ struct EncodedGop {
     uint64_t hrd_init_bits=0, hrd_pauses=0, hrd_underflows=0;
     double hrd_min_after_bits=0.0, hrd_max_pre_bits=0.0;
 };
-// Extremely cheap source-only difficulty estimate for the modern ABR lookahead.
-// It samples a roughly 64x36 luma grid regardless of resolution, so the cost is
-// tiny compared with motion analysis/transform coding and does not add any trial
-// encode.  Spatial gradients preserve static fine detail while temporal change
-// distinguishes genuinely demanding moving material from flat donor GOPs.
-static double estimate_modern_gop_difficulty(const std::vector<libvc1::Frame>& frames) {
-    if (frames.empty()) return 1.0;
-    double sum=0.0;
-    std::array<double,4> top{{1.0,1.0,1.0,1.0}};
-    size_t scored=0;
-    for (size_t fi=0;fi<frames.size();++fi) {
-        const auto& cur=frames[fi];
-        if (cur.width<4 || cur.height<4 || cur.y.empty()) continue;
-        const libvc1::Frame* prev=fi?&frames[fi-1]:nullptr;
-        const int sx=std::max(2,cur.width/64);
-        const int sy=std::max(2,cur.height/36);
-        uint64_t grad=0,grad2=0,temporal=0,hard=0,samples=0;
-        for (int y=sy;y<cur.height;y+=sy) {
-            for (int x=sx;x<cur.width;x+=sx) {
-                const size_t o=static_cast<size_t>(y)*cur.width+x;
-                const int v=cur.y[o];
-                const int dx=std::abs(v-static_cast<int>(cur.y[o-sx]));
-                const int dy=std::abs(v-static_cast<int>(cur.y[o-static_cast<size_t>(sy)*cur.width]));
-                grad+=static_cast<uint64_t>(dx+dy);
-                grad2+=static_cast<uint64_t>(dx*dx+dy*dy);
-                hard+=static_cast<uint64_t>(dx>=48)+static_cast<uint64_t>(dy>=48);
-                if (prev) temporal+=static_cast<uint64_t>(std::abs(v-static_cast<int>(prev->y[o])));
-                ++samples;
-            }
-        }
-        if (!samples) continue;
-        const double g=static_cast<double>(grad)/(2.0*samples);
-        const double grms=std::sqrt(static_cast<double>(grad2)/(2.0*samples));
-        const double t=prev?static_cast<double>(temporal)/samples:0.0;
-        const double edge=static_cast<double>(hard)/(2.0*samples);
-        const double score=std::clamp(1.0+0.014*g+0.012*grms+0.012*t+1.15*edge,0.50,6.0);
-        sum+=score;
-        ++scored;
-        if (score>top.back()) {
-            top.back()=score;
-            for (size_t i=top.size()-1;i>0 && top[i]>top[i-1];--i) std::swap(top[i],top[i-1]);
-        }
-    }
-    if (!scored) return 1.0;
-    const double mean=sum/scored;
-    const size_t ntop=std::min<size_t>(top.size(),scored);
-    const double peak=std::accumulate(top.begin(),top.begin()+static_cast<std::ptrdiff_t>(ntop),0.0)/ntop;
-    return std::clamp(0.65*mean+0.35*peak,0.50,6.0);
-}
-static uint64_t nominal_budget_bits(uint64_t rate_bits, size_t frames, libvc1::Rational fps) {
-    if (!rate_bits || !frames || fps.num<=0 || fps.den<=0) return 0;
-#if defined(__SIZEOF_INT128__)
-    // GCC/Clang provide 128-bit integers on the supported 64-bit targets.
-    // Mark the extension explicitly so -Wpedantic stays useful for accidental
-    // non-standard constructs elsewhere without warning on this intentional,
-    // overflow-safe budget calculation.
-    __extension__ using uint128_t = unsigned __int128;
-    const uint128_t n=static_cast<uint128_t>(rate_bits)*frames*static_cast<uint64_t>(fps.den);
-    return static_cast<uint64_t>(n/static_cast<uint64_t>(fps.num));
-#else
-    const long double v=static_cast<long double>(rate_bits)*frames*fps.den/fps.num;
-    return static_cast<uint64_t>(std::floor(v));
-#endif
-}
 class BoundedCqExceeded : public std::runtime_error {
 public:
     BoundedCqExceeded()
@@ -335,7 +279,6 @@ static double sparse_texture_activity(const libvc1::Frame& f) {
     }
     return n?static_cast<double>(sum)/static_cast<double>(n):0.0;
 }
-
 struct AbrRateControl {
     static constexpr double kQExponent=0.55;
     static constexpr double kComplexityExponent=1.15;
@@ -347,7 +290,6 @@ struct AbrRateControl {
         if (k==GopPictureKind::P) return std::max(64.0, 1.2*mbs + 0.41*pixels*c);
         return std::max(64.0,2.2*mbs + 1.01*pixels*c);
     }
-
     // One-pass ABR state uses exponentially blurred complexity, a running rate
     // factor, overflow correction, per-picture-type size predictors and VBV
     // clipping.
@@ -385,15 +327,10 @@ struct AbrRateControl {
         int b_reference_q=0;
     };
     struct QuantChoice { int q=2; bool halfqp=false; double qscale=1.0; };
-
     std::array<SizePredictor,3> pred{};
     std::array<double,3> last_qscale{{1.0,1.0,1.0}};
     std::array<bool,3> have_last{{false,false,false}};
-    // Legacy libvc1 ABR reference-picture quality relationships.  VC-1 B
-    // pictures in this encoder are disposable, so they must never become
-    // finer than the I/P anchors that carry prediction into later pictures.
-    // Keep the two most recent non-B qscales so B pictures can be tied to
-    // both surrounding reference anchors in display order.
+    // Keep B quality consistent with both reference anchors.
     double previous_non_b_qscale=1.0;
     double last_non_b_qscale=1.0;
     GopPictureKind previous_non_b_kind=GopPictureKind::I;
@@ -409,16 +346,7 @@ struct AbrRateControl {
     double cplxr_sum=0.0;
     double wanted_bits_window=0.0;
     double actual_bits_sum=0.0;
-    // Cumulative type-weighted GOP plan already earned by coded pictures.
-    // Comparing actual bits against frames_done*target_per_frame incorrectly
-    // treats the deliberate refresh-I bonus as debt and starves the first few
-    // following P/B pictures in GOPs whose I picture is expensive.
     double planned_bits_sum=0.0;
-    // Short-term GOP debt uses a separate plan accumulator. Perceptual AQ can
-    // deliberately spend a few extra residual bits in protected regions; the
-    // sampled coding-law estimator supplies a bounded credit for only that
-    // expected local spend. Long-term ABR overflow above continues to compare
-    // real output against the unmodified nominal plan.
     double gop_debt_planned_bits_sum=0.0;
     double target_per_frame=1.0;
     double allocation_scale=1.0;
@@ -428,15 +356,9 @@ struct AbrRateControl {
     uint64_t frames_done=0;
     uint64_t gop_frames_total=0;
     uint64_t gop_i_frames=0, gop_p_frames=0, gop_b_frames=0;
-    // Running estimate of the GOP's total macroblock-class weight. Before a
-    // picture is analyzed, assume every MB belongs to that picture's temporal
-    // class. As each mixed P/B picture becomes known, replace that nominal
-    // picture weight with its actual average I/P/B block mix. Later pictures
-    // therefore compensate automatically so the GOP budget stays normalized.
     double gop_weight_total_estimate=1.0;
     double i_weight=5.0, p_weight=1.0, b_weight=0.70;
     bool initialized=false;
-
     AbrRateControl(uint64_t rate_bits,uint64_t buffer_bits,libvc1::Rational fps) {
         bitrate=std::max(1.0,static_cast<double>(rate_bits));
         buffer_size=std::max(1.0,static_cast<double>(buffer_bits));
@@ -446,17 +368,6 @@ struct AbrRateControl {
         // amount of history instead of allowing ancient frames to dominate.
         const double frac=std::clamp(target_per_frame/buffer_size,0.0,1.0);
         cbr_decay=std::clamp(1.0-0.25*frac,0.90,1.0);
-        // The source/post-motion complexity metric is calibrated in units
-        // close to Q2 coded bits.  The original 0.1.40 size-predictor seed of
-        // 1.0 overestimated actual entropy-coded size by roughly 4-5x on the
-        // development corpus, which distorted the first several decisions in
-        // every independently threaded GOP.  Seed near the measured
-        // bits*qscale/var ratios; online learning still adapts per sequence.
-        // I pictures are the first coded picture of every independently
-        // scheduled GOP, so their initial decision depends especially heavily
-        // on an accurate activity measurement.  0.1.49 fixes the high-resolution
-        // activity sampler below; keep the established predictor coefficients
-        // here and use an actual-size overspend guard after the first I encode.
         pred[0].coeff_min=0.06; pred[0].coeff=0.19;
         pred[1].coeff_min=0.06; pred[1].coeff=0.23;
         pred[2].coeff_min=0.06; pred[2].coeff=0.23;
@@ -468,7 +379,7 @@ struct AbrRateControl {
         const double weighted=i_weight*static_cast<double>(ni)+p_weight*static_cast<double>(np)+
                               b_weight*static_cast<double>(nb);
         gop_weight_total_estimate=weighted>0.0?weighted:static_cast<double>(std::max<uint64_t>(1,n));
-        allocation_scale=std::clamp(scale,0.70,1.60);
+        allocation_scale=scale; // Pass-2 whole-film planning, not a GOP peak-rate cap.
     }
     double effective_target_per_frame() const { return target_per_frame*allocation_scale; }
     static size_t type_index(GopPictureKind k) {
@@ -571,7 +482,6 @@ struct AbrRateControl {
         const double temporal_mult=class_multiplier(temporal_weight);
         return std::max(1e-9,intra_fraction*intra_mult+(1.0-intra_fraction)*temporal_mult);
     }
-
     double reference_bits_adjusted_complexity(GopPictureKind k,double temporal_complexity,
                                               uint64_t reference_bits,int analysis_q,bool analysis_halfqp,
                                               const libvc1::EncoderConfig& cfg,double picture_weight=0.0) const {
@@ -593,10 +503,10 @@ struct AbrRateControl {
     }
     Decision choose(GopPictureKind k,double complexity,const libvc1::EncoderConfig& cfg,
                     libvc1::RateController* vbv,bool maximize,int min_q=1,double coding_law_scale=1.0,
-                    double picture_block_weight=0.0) {
+                    double picture_block_weight=0.0,double picture_scale=1.0,bool offline=false) {
         Decision d;
         const double picture_weight=picture_block_weight>0.0?picture_block_weight:nominal_picture_weight(k);
-        const double picture_plan=planned_picture_bits_for_weight(picture_weight);
+        const double picture_plan=planned_picture_bits_for_weight(picture_weight)*picture_scale;
         const size_t ti=type_index(k);
         d.var=complexity_var(k,complexity,cfg)*std::clamp(coding_law_scale,0.85,1.15);
         auto predict_bits=[&](double picture_qscale) {
@@ -610,6 +520,31 @@ struct AbrRateControl {
         short_term_cplxcount+=1.0;
         const double blurred=short_term_cplxsum/std::max(1e-9,short_term_cplxcount);
         d.rceq=std::pow(std::max(1.0,blurred),1.0-qcompress);
+        if (offline) {
+            // Use the offline allocation without one-pass debt or Q smoothing.
+            double qscale=q_to_scale(1);
+            for (int iteration=0;iteration<5;++iteration) {
+                const double estimate=predict_bits(qscale);
+                qscale=std::clamp(qscale*estimate/std::max(64.0,picture_plan),
+                                  q_to_scale(min_q),q_to_scale(31));
+            }
+            if (vbv) {
+                // Only the explicitly requested Blu-ray mode supplies VBV
+                // in pass 2. Final actual-byte validation still follows.
+                const double allowed=vbv->max_picture_bits();
+                if (predict_bits(qscale)>allowed)
+                    qscale=std::clamp(qscale*predict_bits(qscale)/std::max(32.0,allowed),
+                                      q_to_scale(min_q),q_to_scale(31));
+            }
+            const QuantChoice quant=scale_to_quant(qscale,min_q,cfg.allow_halfqp);
+            d.q=quant.q;d.halfqp=quant.halfqp;d.qscale=quant.qscale;
+            d.block_rate_multiplier=block_rate_multiplier_for_q(
+                k,picture_weight,static_cast<double>(d.q)+(d.halfqp?0.5:0.0));
+            d.predicted_bits=predict_bits(d.qscale);
+            d.target_bits=effective_target_per_frame();
+            d.planned_bits=picture_plan;
+            return d;
+        }
         if (!initialized) {
             wanted_bits_window=effective_target_per_frame();
             // A GOP-local worker cannot inherit a sequential cross-GOP rate factor,
@@ -627,7 +562,6 @@ struct AbrRateControl {
         }
         const double rate_factor=wanted_bits_window/std::max(1e-9,cplxr_sum);
         double qscale=d.rceq/std::max(1e-9,rate_factor);
-
         // VC-1's present B predictor depends more heavily on corrective
         // residual after mode selection. Scale the fixed P/B
         // penalty back toward unity when this picture's *current* measured
@@ -642,7 +576,6 @@ struct AbrRateControl {
             b_quality_factor=kPbFactor-0.30*hard;
             b_debt_strength=1.35-0.80*hard;
         }
-
         // Reference-picture quality priorities: I
         // pictures receive the default 1.4 quality factor and disposable B
         // pictures the default 1.3 coarsening factor.  The older 1.20/1.20
@@ -651,7 +584,6 @@ struct AbrRateControl {
         // finer Q, producing a whole-GOP reference-quality pulse.
         if (k==GopPictureKind::I) qscale/=kIpFactor;
         else if (k==GopPictureKind::B) qscale*=b_quality_factor;
-
         // Long-term overflow compensation: bias quality according to how far
         // actual output has drifted from target.  With ABR+VBV this is gentle;
         // the local rate-factor decay and VBV clipping do most of the work.
@@ -665,7 +597,6 @@ struct AbrRateControl {
             const double abr_buffer=2.0*rate_tolerance*bitrate*std::max(1.0,std::sqrt(std::max(0.0,time_done)));
             const double overflow=std::clamp(1.0+(actual_bits_sum-wanted)/std::max(1.0,abr_buffer),0.5,2.0);
             qscale*=overflow;
-
             // Independent GOP workers cannot share a fully sequential ABR rate factor
             // without serializing the encoder. Close each GOP's nominal
             // budget progressively instead. An expensive refresh I therefore
@@ -688,14 +619,12 @@ struct AbrRateControl {
                 }
             }
         }
-
         // Avoid violent quality jumps of the same picture type.  Asymmetric
         // relaxation lets overshoot correction react faster than undershoot.
         if (have_last[ti]) {
             const double step=1.60;
             qscale=std::clamp(qscale,last_qscale[ti]/step,last_qscale[ti]*step);
         }
-
         // Predict actual coded size and clip against the authoritative VBV when
         // available (retry/serialized path).  This is the frame-level analogue
         // of VBV qscale clipping; a true miss may still take one retry.
@@ -724,7 +653,6 @@ struct AbrRateControl {
                 predicted=predict_bits(qscale);
             }
         }
-
         // If the preceding I picture used less than its intentional
         // type-weighted share, carry that unused budget into the first P
         // reference instead of letting the flat running rate-factor window
@@ -1047,7 +975,7 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
         else ++plan_b;
     }
 
-    AbrRateControl abrrc(p.hrd_rate_bits,p.hrd_buffer_bits,p.cfg.fps);
+    AbrRateControl abrrc(p.target_rate_bits,p.hrd_buffer_bits,p.cfg.fps);
     abrrc.set_gop_plan(n,plan_i,plan_p,plan_b,p.modern_budget_scale,
                         p.rc_i_weight,p.rc_p_weight,p.rc_b_weight);
 
@@ -1180,7 +1108,9 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
         // Announce the analyzed block mix exactly once. Unknown future pictures
         // remain at their nominal temporal-class weight until their analysis is
         // available, so later plans repay any extra I-block share automatically.
-        abrrc.announce_picture_block_weight(pk,picture_block_weight);
+        const double measured_weight=p.two_pass_picture_scale.empty()?1.0:
+            p.two_pass_picture_scale.at(local);
+        abrrc.announce_picture_block_weight(pk,picture_block_weight*measured_weight);
 
         const bool aq_predictable_texture_picture = p.cfg.adaptive_quality && !skip_pic &&
             pk!=GopPictureKind::I && sparse_texture_activity(f)>=90.0;
@@ -1353,9 +1283,9 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
             predicted_q=selected_q;
             predicted_halfqp=selected_halfqp;
             rc_complexity=0.0;
-            rc_allowed_bits=rate_control?rate_control->max_picture_bits():static_cast<double>(p.hrd_buffer_bits);
+            rc_allowed_bits=rate_control?rate_control->max_picture_bits():0.0;
             rc_target_bits=abrrc.effective_target_per_frame();
-            rc_planned_bits=abrrc.planned_picture_bits(GopPictureKind::P);
+            rc_planned_bits=abrrc.planned_picture_bits(GopPictureKind::P)*measured_weight;
             EncodedChoice& sc=evaluate(selected_q,selected_halfqp);
             rc_first_actual_bits=static_cast<uint64_t>(sc.au.size())*8ull;
             rc_predicted_bits=static_cast<double>(rc_first_actual_bits); // exact fixed syntax, not a learned P prediction
@@ -1385,7 +1315,7 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
                     picture_block_weight);
             }
 
-            rc_allowed_bits=rate_control?rate_control->max_picture_bits():static_cast<double>(p.hrd_buffer_bits);
+            rc_allowed_bits=rate_control?rate_control->max_picture_bits():0.0;
 
             // 0.1.72 ABR coding-law integration. Obtain a provisional legal
             // integer/half-step Q from an untouched controller copy, resolve
@@ -1398,7 +1328,7 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
             auto provisional_rc=abrrc;
             const auto provisional=provisional_rc.choose(pk,rc_complexity,rc_cfg,rate_control,
                                                           p.bounded_maximize,p.bounded_min_q,1.0,
-                                                          picture_block_weight);
+                                                          picture_block_weight,measured_weight,p.two_pass_mode==2);
             libvc1::EncoderConfig lawcfg=rc_cfg;
             lawcfg.pqindex=provisional.q;
             lawcfg.halfqp=provisional.halfqp;
@@ -1452,7 +1382,7 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
             auto decision=[&]{
                 libvc1::SpeedProfileScope speed_scope(p.cfg.speed_profiler,libvc1::SpeedProfileOp::RateControl);
                 return abrrc.choose(pk,rc_complexity,rc_cfg,rate_control,p.bounded_maximize,
-                                     p.bounded_min_q,coding_law_scale,picture_block_weight);
+                                     p.bounded_min_q,coding_law_scale,picture_block_weight,measured_weight,p.two_pass_mode==2);
             }();
             predicted_q=decision.q;
             predicted_halfqp=decision.halfqp;
@@ -1478,7 +1408,7 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
             // weighting while bounding pathological first-I predictor misses.
             // The retry still reuses the already-computed intra analysis and
             // remains limited to at most one extra I encode.
-            if (pk==GopPictureKind::I && selected_q<31 &&
+            if (p.two_pass_mode!=2 && pk==GopPictureKind::I && selected_q<31 &&
                 actual>decision.planned_bits*1.35) {
                 double repair_target=decision.planned_bits*1.20;
                 if (rate_control) repair_target=std::min(repair_target,rc_allowed_bits*0.95);
@@ -1502,7 +1432,7 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
             // and land below 20% of its meaningful frame-budget reference.
             // In that extreme case only, repeat transform/quantization/entropy coding at a
             // bounded finer Q. Motion analysis and mode decisions are reused.
-            if (pk==GopPictureKind::B && predicted_q>p.bounded_min_q &&
+            if (p.two_pass_mode!=2 && pk==GopPictureKind::B && predicted_q>p.bounded_min_q &&
                 decision.var>=decision.planned_bits*1.50) {
                 // Compare the actual first encode against both the local
                 // type-weighted plan and the nominal/current frame target.
@@ -1535,6 +1465,7 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
                     }
                 }
             }
+
 
             // Ordinary pictures avoid whole-frame re-encoding; without row-level VBV feedback the encoder cannot
             // react before the frame finishes. VC-1 currently lacks that
@@ -1714,6 +1645,19 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
             picture.rc_prediction_error_percent=rc_predicted_bits>0.0
                 ? (static_cast<double>(rc_first_actual_bits)-rc_predicted_bits)*100.0/rc_predicted_bits : 0.0;
         }
+        if (p.two_pass_mode==1) {
+            picture.pass1_mse_y=vc1_twopass::plane_mse(f.y,reconstructed[local].y);
+            picture.pass1_mse_uv=vc1_twopass::chroma_mse(f.u,f.v,reconstructed[local].u,reconstructed[local].v);
+            picture.debug_intra_macroblocks=picture_intra_mbs;
+            if (pk==GopPictureKind::P) picture.debug_moved_macroblocks=panalysis.moved_macroblocks;
+            if (pk==GopPictureKind::B) picture.debug_moved_macroblocks=banalysis.moved_macroblocks;
+        }
+        if (p.two_pass_mode!=0) {
+            picture.two_pass_budget_scale=p.modern_budget_scale;
+            picture.two_pass_i_weight=p.rc_i_weight;
+            picture.two_pass_p_weight=p.rc_p_weight;
+            picture.two_pass_b_weight=p.rc_b_weight;
+        }
         if (p.debug_stats) {
             picture.debug_scene_i=scene_i;
             picture.debug_motion_failure_i=motion_failure_i;
@@ -1888,6 +1832,8 @@ static EncodedGop encode_gop_once(uint64_t index, uint64_t start_frame,
 static EncodedGop encode_gop(uint64_t index, uint64_t start_frame,
                              std::vector<libvc1::Frame> frames,
                              GopEncodeParams p) {
+    if (p.two_pass_mode==2 && !p.cfg.bluray_compat)
+        return encode_gop_once(index,start_frame,frames,std::move(p));
     if (p.bounded_cq) {
         // Fast speculative libvc1 ABR pass. Authoritative global VBV validation
         // happens later in strict output order; only a true reservoir violation
@@ -2004,9 +1950,9 @@ static int validate_dimensions_and_level(const vc1_param_t& p,int coded_width,in
         if (mbs>8192 || macroblock_rate_exceeds(mbs,p,245760))
             throw std::runtime_error("resolution/frame rate exceeds VC-1 Main Profile High level limits");
         if (p.i_rc_method==VC1_RC_ABR) {
-            if (p.i_bitrate>20000000ull)
+            if (p.i_two_pass!=2 && resolved_peak_bitrate(p)>20000000ull)
                 throw std::runtime_error("bitrate exceeds VC-1 Main Profile High Rmax (20 Mbit/s)");
-            if (p.i_vbv_buffer_size>40009728ull)
+            if ((p.i_two_pass!=2 || p.b_bluray_compat) && p.i_vbv_buffer_size>40009728ull)
                 throw std::runtime_error("VBV buffer exceeds VC-1 Main Profile High VBVmax");
         }
         return 0;
@@ -2018,29 +1964,19 @@ static int validate_dimensions_and_level(const vc1_param_t& p,int coded_width,in
     if (mbs>16384 || macroblock_rate_exceeds(mbs,p,491520))
         throw std::runtime_error("resolution/frame rate exceeds VC-1 Advanced Profile Level 4 limits");
     if (p.i_rc_method==VC1_RC_ABR) {
-        if (p.i_bitrate>135000000ull)
+        if (p.i_two_pass!=2 && resolved_peak_bitrate(p)>135000000ull)
             throw std::runtime_error("bitrate exceeds VC-1 Advanced Profile Level 4 Rmax (135 Mbit/s)");
-        if (p.i_vbv_buffer_size>270336000ull)
+        if ((p.i_two_pass!=2 || p.b_bluray_compat) && p.i_vbv_buffer_size>270336000ull)
             throw std::runtime_error("VBV buffer exceeds VC-1 Advanced Profile Level 4 Bmax");
     }
 
-    // Preserve the historical AP@L3 signal whenever the stream fits. Upgrade
-    // only the combinations that actually need AP@L4.
+    // Preserve AP@L3 when possible. Non-Blu-ray pass 2 may deliberately exceed
+    // even L4's nominal rate; that output is not level-rate conformant.
     const bool needs_l4 = mbs>8192 || macroblock_rate_exceeds(mbs,p,245760) ||
         (p.i_rc_method==VC1_RC_ABR &&
-         (p.i_bitrate>45000000ull || p.i_vbv_buffer_size>90112000ull));
+         (resolved_peak_bitrate(p)>45000000ull ||
+          ((p.i_two_pass!=2 || p.b_bluray_compat) && p.i_vbv_buffer_size>90112000ull)));
     return needs_l4 ? 4 : 3;
-}
-
-static bool fps_equals(const vc1_param_t& p,int num,int den=1) {
-    const int64_t a=static_cast<int64_t>(p.i_fps_num);
-    const int64_t b=static_cast<int64_t>(p.i_fps_den);
-    return a*static_cast<int64_t>(den)==static_cast<int64_t>(num)*b;
-}
-
-static uint64_t bluray_keyint_limit(const vc1_param_t& p) {
-    const long double fps=static_cast<long double>(p.i_fps_num)/p.i_fps_den;
-    return static_cast<uint64_t>(std::max<long long>(1,std::llround(fps)));
 }
 
 static uint64_t resolved_keyint(const vc1_param_t& p) {
@@ -2049,43 +1985,6 @@ static uint64_t resolved_keyint(const vc1_param_t& p) {
     // VC-1 syntax requirement. Generic VC-1 uses a modest 120-frame default;
     // callers remain free to request any positive interval explicitly.
     return p.b_bluray_compat ? bluray_keyint_limit(p) : 120u;
-}
-
-static void validate_bluray_compat(const vc1_param_t& p,int advanced_level) {
-    if (!p.b_bluray_compat) return;
-    if (p.i_profile!=VC1_PROFILE_ADVANCED)
-        throw std::runtime_error("--bluray-compat requires VC-1 Advanced Profile");
-    if (advanced_level>3)
-        throw std::runtime_error("--bluray-compat requires VC-1 Advanced Profile Level 3 or lower");
-    if ((p.i_width&1) || (p.i_height&1))
-        throw std::runtime_error("--bluray-compat does not permit odd picture dimensions");
-    if (p.i_rc_method==VC1_RC_ABR) {
-        if (p.i_bitrate>40000000ull)
-            throw std::runtime_error("--bluray-compat bitrate exceeds 40 Mbit/s");
-        if (p.i_vbv_buffer_size>30000000ull)
-            throw std::runtime_error("--bluray-compat VBV exceeds 30 Mbit");
-    }
-
-    const bool progressive=p.i_scan_mode==VC1_SCAN_PROGRESSIVE;
-    const bool interlaced=!progressive;
-    bool legal=false;
-    if ((p.i_width==1920 || p.i_width==1440) && p.i_height==1080) {
-        legal = (progressive && (fps_equals(p,24000,1001) || fps_equals(p,24))) ||
-                (interlaced && (fps_equals(p,30000,1001) || fps_equals(p,25)));
-    } else if (p.i_width==1280 && p.i_height==720) {
-        legal = progressive && (fps_equals(p,60000,1001) || fps_equals(p,50) ||
-                                fps_equals(p,24000,1001) || fps_equals(p,24));
-    } else if (p.i_width==720 && p.i_height==480) {
-        legal = interlaced && fps_equals(p,30000,1001);
-    } else if (p.i_width==720 && p.i_height==576) {
-        legal = interlaced && fps_equals(p,25);
-    }
-    if (!legal)
-        throw std::runtime_error("resolution/frame-rate/scan combination is outside the Blu-ray VC-1 video subset");
-
-    const uint64_t max_keyint=bluray_keyint_limit(p);
-    if (p.i_keyint_max>0 && static_cast<uint64_t>(p.i_keyint_max)>max_keyint)
-        throw std::runtime_error("--bluray-compat keyframe interval exceeds approximately one second");
 }
 
 static libvc1::Frame copy_input_picture(const vc1_param_t& p,const vc1_picture_t& pic) {
@@ -2244,13 +2143,13 @@ struct vc1_t {
     // probes independently; only output-order acceptance/retry touches this state.
     std::unique_ptr<libvc1::RateController> bounded_rate_control;
     int bounded_current_q=2;
-    // Sliding modern lookahead credit is denominated in soft target bits, not
-    // actual VBV fullness.  Easy GOPs may reserve it only when harder content
-    // is visible in the next two GOPs; later hard GOPs can spend only this
-    // previously reserved amount.  The global RateController remains the hard
-    // authority over actual coded bits and VBV fullness.
-    double modern_lookahead_credit_bits=0.0;
-    double modern_lookahead_credit_difficulty_sum=0.0;
+    vc1_twopass::Plan two_pass;
+    std::unique_ptr<vc1_twopass::BudgetLedger> two_pass_budget;
+    std::string stats_path_owned;
+    std::ofstream pass1_stats;
+    std::vector<uint64_t> source_fingerprints;
+    uint64_t pass1_total_bits=0;
+    bool pass1_complete=false;
 
     ~vc1_t() {
         // Recovery jobs may read immutable configuration plus the still-private
@@ -2268,14 +2167,14 @@ struct vc1_t {
 
     size_t gop_worker_limit() const {
         // 0.1.63: outer GOP workers are the steady-state throughput path.
-        // 0.1.36 divided this limit by the maximum intra-GOP helper count
-        // (normally three with two B pictures), permanently reserving helper
-        // slots even though B/scene analysis uses them only briefly. That
-        // produced the characteristic full-CPU burst followed by a long
-        // low-utilization interval. Keep one independent GOP worker per
-        // requested thread; the at-most-two B-analysis helpers remain transient
-        // and preserve the existing deterministic coding-order handoff.
-        return static_cast<size_t>(std::max(1,param.i_threads));
+        if (!two_pass_budget) return static_cast<size_t>(std::max(1,param.i_threads));
+        {
+            // A short two-pass clip cannot use every GOP as a speculative
+            // worker: it would finish before any measured size can feed back.
+            // Long films still use all the requested worker threads.
+            return std::min(static_cast<size_t>(std::max(1,param.i_threads)),std::max<size_t>(1,
+                static_cast<size_t>(std::sqrt(static_cast<double>(two_pass.gops.size())))));
+        }
     }
 
     void pump_workers() {
@@ -2291,6 +2190,11 @@ struct vc1_t {
         while (!queued.empty() && pending.size()<gop_worker_limit()) {
             PlannedGop job=std::move(queued.front()); queued.pop_front();
             const uint64_t index=job.index;
+            if (two_pass_budget) {
+                // Apply the correction when the worker is actually launched,
+                // not when piped source input first forms this GOP.
+                job.params.modern_budget_scale*=two_pass_budget->launch(index);
+            }
             PendingGopFuture pf;
             pf.index=index;
             pf.future=std::async(std::launch::async,
@@ -2301,87 +2205,31 @@ struct vc1_t {
         }
     }
 
-    void plan_window(bool flush) {
-        constexpr size_t kModernLookaheadGops=3;
-        if (base.cq_set) {
-            while (!planning.empty()) { queued.push_back(std::move(planning.front())); planning.pop_front(); }
-            pump_workers();
-            return;
-        }
-
-        // Sliding current+2-future ABR window. Keep two GOPs of source
-        // ahead of the dispatched GOP so difficult scenes can borrow only credit
-        // that preceding easier GOPs deliberately reserve.
-        while (planning.size()>=kModernLookaheadGops || (flush && !planning.empty())) {
-            const size_t count=std::min(kModernLookaheadGops,planning.size());
-            auto& cur=planning.front();
-            const uint64_t nominal=nominal_budget_bits(base.hrd_rate_bits,cur.frames.size(),cfg.fps);
-            double target=static_cast<double>(nominal);
-            const double current_d=std::clamp(cur.difficulty,0.50,6.0);
-            cur.params.modern_difficulty=current_d;
-            cur.params.modern_nominal_gop_bits=nominal;
-
-            double future_weight=0.0,future_dsum=0.0,future_reserve_capacity=0.0;
-            for (size_t i=1;i<count;++i) {
-                const double fd=std::clamp(planning[i].difficulty,0.50,6.0);
-                const double fw=static_cast<double>(planning[i].frames.size());
-                future_weight+=fw;
-                future_dsum+=fw*fd;
-                if (fd>current_d*1.08) {
-                    const uint64_t fn=nominal_budget_bits(base.hrd_rate_bits,planning[i].frames.size(),cfg.fps);
-                    const double ratio=fd/std::max(0.25,current_d);
-                    const double frac=std::clamp(0.45*(ratio-1.0),0.0,0.60);
-                    future_reserve_capacity+=static_cast<double>(fn)*frac;
-                }
-            }
-            const double future_d=future_weight>0.0?future_dsum/future_weight:current_d;
-            const uint64_t full_gop_nominal=nominal_budget_bits(base.hrd_rate_bits,
-                static_cast<size_t>(std::max<uint64_t>(1,keyint)),cfg.fps);
-            const double credit_cap=std::max(0.0,std::min(
-                static_cast<double>(base.hrd_buffer_bits)*0.40,
-                static_cast<double>(full_gop_nominal)*0.75));
-
-            const double reserve_cap=std::min(credit_cap,future_reserve_capacity);
-            if (count>1 && nominal && future_d>current_d*1.08 &&
-                modern_lookahead_credit_bits<reserve_cap) {
-                const double ratio=future_d/std::max(0.25,current_d);
-                const double fraction=std::clamp(0.22*(ratio-1.0),0.0,0.30);
-                const double wanted=static_cast<double>(nominal)*fraction;
-                const double saved=std::min(wanted,reserve_cap-modern_lookahead_credit_bits);
-                target-=saved;
-                modern_lookahead_credit_bits+=saved;
-                modern_lookahead_credit_difficulty_sum+=saved*current_d;
-            } else if (nominal && modern_lookahead_credit_bits>0.5) {
-                const double donor_d=modern_lookahead_credit_difficulty_sum/
-                    std::max(0.5,modern_lookahead_credit_bits);
-                if (current_d>donor_d*1.08) {
-                    const double ratio=current_d/std::max(0.25,donor_d);
-                    const double fraction=std::clamp(0.45*(ratio-1.0),0.0,0.60);
-                    const double extra=std::min(modern_lookahead_credit_bits,
-                        static_cast<double>(nominal)*fraction);
-                    if (extra>0.0) {
-                        const double old_credit=modern_lookahead_credit_bits;
-                        target+=extra;
-                        modern_lookahead_credit_bits-=extra;
-                        if (modern_lookahead_credit_bits<=0.5) {
-                            modern_lookahead_credit_bits=0.0;
-                            modern_lookahead_credit_difficulty_sum=0.0;
-                        } else {
-                            modern_lookahead_credit_difficulty_sum*=
-                                modern_lookahead_credit_bits/old_credit;
-                        }
-                    }
-                }
-            }
-            cur.params.modern_budget_scale=nominal
-                ? std::clamp(target/static_cast<double>(nominal),0.70,1.60) : 1.0;
-            cur.params.modern_target_gop_bits=nominal
-                ? static_cast<uint64_t>(std::llround(static_cast<double>(nominal)*cur.params.modern_budget_scale)) : 0;
+    void plan_window(bool /*flush*/) {
+        // No future-GOP buffering: dispatch the current GOP immediately. A two-pass run
+        // obtains whole-film information from disk, not from raw frame buffers.
+        while (!planning.empty()) {
             queued.push_back(std::move(planning.front()));
             planning.pop_front();
-            if (!flush) break;
         }
         pump_workers();
+    }
+
+    void apply_two_pass_plan(GopEncodeParams& params,uint64_t index,uint64_t start,size_t frames) const {
+        if (param.i_two_pass!=2) return;
+        if (index>=two_pass.gops.size())
+            throw std::runtime_error("pass 2 has more GOPs than its statistics");
+        const auto& plan=two_pass.gops[static_cast<size_t>(index)];
+        if (plan.start!=start || plan.frames!=frames)
+            throw std::runtime_error("pass 2 GOP layout differs from pass 1 (scene cut/keyframe mismatch)");
+        params.modern_budget_scale=plan.scale;
+        params.modern_difficulty=plan.difficulty;
+        params.two_pass_picture_scale=plan.frame_scale;
+        if (param.b_two_pass_dynamic_weights) {
+            params.rc_i_weight*=plan.dynamic[0];
+            params.rc_p_weight*=plan.dynamic[1];
+            params.rc_b_weight*=plan.dynamic[2];
+        }
     }
 
     void submit_prefix(size_t count,bool scene_scan_complete) {
@@ -2416,7 +2264,7 @@ struct vc1_t {
         current_gop_start+=count;
         current_gop_starts_scene_i=false;
         current_gop_starts_motion_failure_i=false;
-        job.difficulty=base.bounded_cq?estimate_modern_gop_difficulty(job.frames):1.0;
+        apply_two_pass_plan(job.params,job.index,job.start,job.frames.size());
         planning.push_back(std::move(job));
         plan_window(false);
     }
@@ -2571,6 +2419,7 @@ struct vc1_t {
         auto attempt = [&](int minimum_q) -> std::optional<std::pair<EncodedGop,libvc1::RateController>> {
             libvc1::RateController trial=start_state;
             GopEncodeParams rp=base;
+            apply_two_pass_plan(rp,probe.index,probe.start_frame,probe.retry_source.size());
             rp.previous_source=probe.previous_source;
             rp.cq_set=false;
             rp.bounded_cq=true;
@@ -2752,6 +2601,7 @@ struct vc1_t {
                        const std::shared_ptr<const libvc1::Frame>& previous_source)->bool {
             states.push_back(trial); qs.push_back(q);
             GopEncodeParams rp=base;
+            apply_two_pass_plan(rp,index,start_frame,source.size());
             rp.previous_source=previous_source;
             rp.cq_set=false; rp.bounded_cq=true;
             rp.bounded_start_q=std::max(q,minimum_q);
@@ -2888,6 +2738,13 @@ struct vc1_t {
 
     void finalize_gop(EncodedGop&& g) {
         if (g.index!=gops_written) throw std::runtime_error("internal finalized GOP output-order mismatch");
+        if (two_pass_budget) {
+            double actual=0.0;
+            for (const auto& pic:g.pictures) actual+=static_cast<double>(pic.au.size())*8.0;
+            two_pass_budget->commit(g.index,actual);
+            stats.i_rate_total_bits+=static_cast<uint64_t>(actual);
+            stats.i_rate_frames+=g.pictures.size();
+        }
         aggregate(g);
         for (auto& pic:g.pictures) {
             const uint64_t display=g.start_frame+pic.display_index;
@@ -2920,6 +2777,14 @@ struct vc1_t {
 
     void hold_bounded_gop(EncodedGop g,EncodedGop probe,
                           libvc1::RateController state_before,int q_before) {
+        if (param.i_two_pass!=0) {
+            // Disk stats replace private source history; publish each accepted
+            // GOP immediately rather than holding 2+ raw GOPs for rollback.
+            g.retry_source.clear();probe.retry_source.clear();g.bounded_probe=false;
+            ++gops_drained;
+            finalize_gop(std::move(g));
+            return;
+        }
         std::vector<libvc1::Frame> source;
         if (!g.retry_source.empty()) source=std::move(g.retry_source);
         else source=std::move(probe.retry_source);
@@ -2959,6 +2824,8 @@ struct vc1_t {
                 return true;
             }
 
+            if (param.i_two_pass!=0)
+                throw std::runtime_error("two-pass VBV/HRD limit cannot be met by this GOP even at Q31; increase bitrate or buffer size");
             // Current-GOP-only recovery is mathematically impossible from this
             // boundary. Rewind only GOPs that are still private to libvc1; no AU
             // previously returned to the caller can ever change.
@@ -3002,7 +2869,7 @@ struct vc1_t {
     void process_completed_probe(EncodedGop probe) {
         if (probe.index!=gops_drained) throw std::runtime_error("internal GOP output-order mismatch");
 
-        if (base.bounded_cq) {
+        if (base.bounded_cq && !(param.i_two_pass==2 && !param.b_bluray_compat)) {
             if (!bounded_rate_control || !probe.bounded_probe)
                 throw std::runtime_error("internal libvc1 ABR rate-control GOP state mismatch");
             libvc1::RateController state_before=*bounded_rate_control;
@@ -3087,7 +2954,15 @@ struct vc1_t {
     }
 
     int emit_one(vc1_au_t** pp_au,int* pi_au,vc1_picture_t* pic_out) {
-        if (ready.empty()) { *pp_au=nullptr; *pi_au=0; return 0; }
+        if (ready.empty()) {
+            if (param.i_two_pass==1 && !pass1_complete && input_finished && pictures_output==frames_received && frames_received>0) {
+                pass1_stats<<"END "<<pictures_output<<' '<<pass1_total_bits<<'\n';
+                pass1_stats.flush();
+                if (!pass1_stats) throw std::runtime_error("cannot finalize two-pass statistics");
+                pass1_stats.close();pass1_complete=true;
+            }
+            *pp_au=nullptr; *pi_au=0; return 0;
+        }
         current_output=std::move(ready.front()); ready.pop_front();
         current_au={};
         current_au.p_payload=current_output.pic.au.data();
@@ -3104,6 +2979,10 @@ struct vc1_t {
         current_au.i_display_order=current_output.global_display;
         current_au.i_coded_order=current_output.coded_order;
         current_au.f_rc_complexity=current_output.pic.rc_complexity;
+        current_au.f_two_pass_gop_scale=current_output.pic.two_pass_budget_scale;
+        current_au.f_two_pass_i_weight=current_output.pic.two_pass_i_weight;
+        current_au.f_two_pass_p_weight=current_output.pic.two_pass_p_weight;
+        current_au.f_two_pass_b_weight=current_output.pic.two_pass_b_weight;
         current_au.f_rc_predicted_bits=current_output.pic.rc_predicted_bits;
         current_au.f_rc_target_bits=current_output.pic.rc_target_bits;
         current_au.f_rc_allowed_bits=current_output.pic.rc_allowed_bits;
@@ -3118,10 +2997,12 @@ struct vc1_t {
             current_au.p_debug_macroblocks=current_output.pic.macroblock_debug.data();
             current_au.i_debug_macroblocks=current_output.pic.macroblock_debug.size();
         }
-        if (param.b_debug_stats) {
+        if (param.b_debug_stats || param.i_two_pass!=0) {
             current_au.i_debug_gop_index=current_output.gop_index;
             current_au.i_debug_frame_in_gop=current_output.pic.display_index;
             current_au.i_debug_gop_frames=current_output.gop_frames;
+        }
+        if (param.b_debug_stats) {
             current_au.b_debug_scene_i=current_output.pic.debug_scene_i?1:0;
             current_au.b_debug_motion_failure_i=current_output.pic.debug_motion_failure_i?1:0;
             current_au.f_debug_qscale=current_output.pic.debug_qscale;
@@ -3181,7 +3062,30 @@ struct vc1_t {
                 pic_out->prop.transform_map_size=current_output.pic.transform_map.size();
             }
         }
+        if (param.i_two_pass==1) {
+            if (!pass1_stats || current_au.i_display_order>=source_fingerprints.size())
+                throw std::runtime_error("two-pass statistics stream or frame index invalid");
+            const uint64_t bits=static_cast<uint64_t>(current_au.i_payload)*8ull;
+            if (bits>std::numeric_limits<uint64_t>::max()-pass1_total_bits)
+                throw std::runtime_error("two-pass statistics bit count overflow");
+            pass1_total_bits+=bits;
+            pass1_stats<<"F "<<current_au.i_coded_order<<' '<<current_au.i_display_order<<' '
+                <<current_output.gop_index<<' '
+                <<(current_au.i_type==VC1_TYPE_I?'I':(current_au.i_type==VC1_TYPE_B?'B':'P'))<<' '
+                <<bits<<' '<<current_au.i_qp<<' '<<std::setprecision(17)
+                <<current_au.f_rc_complexity<<' '<<current_output.pic.debug_intra_macroblocks<<' '
+                <<current_output.pic.debug_moved_macroblocks<<' '
+                <<source_fingerprints.at(static_cast<size_t>(current_au.i_display_order))<<' '
+                <<current_output.pic.pass1_mse_y<<' '<<current_output.pic.pass1_mse_uv<<'\n';
+            if (!pass1_stats) throw std::runtime_error("write failed on two-pass statistics");
+        }
         ++pictures_output;
+        if (param.i_two_pass==1 && !pass1_complete && input_finished && pictures_output==frames_received) {
+            pass1_stats<<"END "<<pictures_output<<' '<<pass1_total_bits<<'\n';
+            pass1_stats.flush();
+            if (!pass1_stats) throw std::runtime_error("cannot finalize two-pass statistics");
+            pass1_stats.close();pass1_complete=true;
+        }
         return static_cast<int>(current_au.i_payload);
     }
 };
@@ -3193,6 +3097,10 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         if (input->i_struct_size < static_cast<int>(sizeof(vc1_param_t)) || input->i_api_version!=LIBVC1_API_VERSION)
             throw std::runtime_error("libvc1 parameter ABI mismatch");
         auto e=std::make_unique<vc1_t>(); e->param=*input;
+        if (input->psz_two_pass_stats_file) {
+            e->stats_path_owned=input->psz_two_pass_stats_file;
+            e->param.psz_two_pass_stats_file=e->stats_path_owned.c_str();
+        }
         auto& p=e->param;
         if (p.i_fps_num<=0 || p.i_fps_den<=0) throw std::runtime_error("invalid frame rate");
         if (p.i_profile!=VC1_PROFILE_ADVANCED && p.i_profile!=VC1_PROFILE_MAIN) throw std::runtime_error("unsupported VC-1 profile");
@@ -3248,6 +3156,22 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         if (p.i_quantizer_type<VC1_QUANTIZER_AUTO || p.i_quantizer_type>VC1_QUANTIZER_NONUNIFORM) throw std::runtime_error("invalid quantizer type");
         if (p.b_rc_maximize!=0 && p.b_rc_maximize!=1) throw std::runtime_error("rate-control maximize flag must be 0 or 1");
         if (p.i_rc_method!=VC1_RC_ABR && p.i_rc_method!=VC1_RC_CQP) throw std::runtime_error("unsupported rate-control method");
+        if (p.i_two_pass<0 || p.i_two_pass>2 || (p.i_two_pass &&
+            (!p.psz_two_pass_stats_file || !*p.psz_two_pass_stats_file)))
+            throw std::runtime_error("two-pass mode must be 0, 1, or 2 and requires a statistics filename");
+        if (p.i_two_pass && p.i_rc_method!=VC1_RC_ABR)
+            throw std::runtime_error("two-pass rate control requires ABR; --cq is not supported");
+        if (p.i_peak_bitrate && p.i_rc_method!=VC1_RC_ABR)
+            throw std::runtime_error("--max-bitrate requires bitrate-controlled mode, not --cq");
+        if (p.i_two_pass==2 && !p.b_bluray_compat && p.i_peak_bitrate)
+            throw std::runtime_error("non-Blu-ray second pass has unrestricted peak; --max-bitrate requires --bluray-compat");
+        if (p.i_rc_method==VC1_RC_ABR && p.i_two_pass!=2 && p.i_peak_bitrate &&
+            p.i_bitrate>p.i_peak_bitrate)
+            throw std::runtime_error("average bitrate exceeds explicitly requested maximum bitrate");
+        if ((p.b_two_pass_dynamic_weights!=0 && p.b_two_pass_dynamic_weights!=1) ||
+            !std::isfinite(p.f_two_pass_dynamic_strength) ||
+            p.f_two_pass_dynamic_strength<0.0 || p.f_two_pass_dynamic_strength>2.0)
+            throw std::runtime_error("two-pass dynamic weights must be enabled/disabled and strength 0..2");
         auto valid_rc_weight=[](double v){ return std::isfinite(v) && v>=0.05 && v<=20.0; };
         if (!valid_rc_weight(p.f_rc_i_weight) || !valid_rc_weight(p.f_rc_p_weight) || !valid_rc_weight(p.f_rc_b_weight))
             throw std::runtime_error("I/P/B rate-control weights must be finite and in the range 0.05..20");
@@ -3259,7 +3183,10 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
             throw std::runtime_error("residual-priority strength must be finite and 0..12 Q-index steps");
         if (!std::isfinite(p.f_inter_intra_threshold) || p.f_inter_intra_threshold<0.05 || p.f_inter_intra_threshold>2.0)
             throw std::runtime_error("inter/intra threshold must be finite and 0.05..2.0");
-        if (p.i_rc_method==VC1_RC_ABR && (p.i_bitrate<64000 || p.i_vbv_buffer_size<65536)) throw std::runtime_error("invalid bitrate/VBV buffer");
+        if (p.i_rc_method==VC1_RC_ABR &&
+            ((p.i_two_pass==2 && !p.b_bluray_compat) ? !p.i_bitrate :
+             (p.i_bitrate<64000 || p.i_vbv_buffer_size<65536)))
+            throw std::runtime_error("invalid bitrate/VBV buffer");
         // Advanced Profile bitrate/VBV limits are validated against the selected
         // SMPTE 421M level in validate_dimensions_and_level().  Do not retain
         // the older Blu-ray-only 40 Mbit/s / 30 Mbit guards here: AP@L4 permits
@@ -3327,6 +3254,18 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         selected=dispatch.tier[0];
         for (const auto t:dispatch.tier) if (t!=selected) { selected=libvc1::SimdTier::Mixed; break; }
 
+        if (p.i_two_pass==2) {
+            e->two_pass=vc1_twopass::read_plan(p.psz_two_pass_stats_file,p,
+                  p.b_two_pass_dynamic_weights?p.f_two_pass_dynamic_strength:0.0);
+            e->two_pass_budget=std::make_unique<vc1_twopass::BudgetLedger>(
+                e->two_pass,p.i_bitrate,p.i_fps_num,p.i_fps_den);
+        }
+        if (p.i_two_pass==1) {
+            e->pass1_stats.open(p.psz_two_pass_stats_file,std::ios::binary|std::ios::trunc);
+            if (!e->pass1_stats) throw std::runtime_error("cannot create two-pass statistics file");
+            e->pass1_stats<<"LIBVC1_TWO_PASS 2 "<<vc1_twopass::signature(p)<<'\n';
+            if (!e->pass1_stats) throw std::runtime_error("cannot write two-pass statistics header");
+        }
         e->cfg.width=coded_width; e->cfg.height=coded_height;
         e->cfg.display_width=p.i_width; e->cfg.display_height=p.i_height;
         e->cfg.advanced_level=advanced_level; e->cfg.bluray_compat=p.b_bluray_compat!=0; e->cfg.fps={p.i_fps_num,p.i_fps_den};
@@ -3356,8 +3295,17 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
 
         libvc1::HrdValue rate{},buffer{};
         if (p.i_rc_method==VC1_RC_ABR) {
-            rate=libvc1::hrd_floor(p.i_bitrate,6); buffer=libvc1::hrd_floor(p.i_vbv_buffer_size,4);
-            e->cfg.hrd_enabled=p.i_profile==VC1_PROFILE_ADVANCED;
+            if (p.i_two_pass==2 && !p.b_bluray_compat)
+                rate.represented=p.i_bitrate; // No HRD syntax, hence no HRD representability ceiling.
+            else
+                rate=libvc1::hrd_floor(resolved_peak_bitrate(p),6);
+            if (p.i_two_pass!=2 || p.b_bluray_compat)
+                buffer=libvc1::hrd_floor(p.i_vbv_buffer_size,4);
+            // A non-Blu-ray offline pass has an average-size objective, not
+            // a hypothetical HRD peak/buffer. Do not signal HRD constraints
+            // that its output deliberately does not satisfy.
+            e->cfg.hrd_enabled=p.i_profile==VC1_PROFILE_ADVANCED &&
+                (p.i_two_pass!=2 || p.b_bluray_compat);
             e->cfg.hrd_bit_rate_exponent=rate.exponent; e->cfg.hrd_buffer_size_exponent=buffer.exponent;
             e->cfg.hrd_rate=rate.mantissa; e->cfg.hrd_buffer=buffer.mantissa;
         }
@@ -3371,7 +3319,8 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
                 static_cast<long double>(p.i_fps_num)/static_cast<long double>(p.i_fps_den);
             e->scene_cut_min_frames=static_cast<uint64_t>(std::max<long double>(1.0L,std::ceil(frames-1e-12L)));
         }
-        e->base.cfg=e->cfg; e->base.cq_set=p.i_rc_method==VC1_RC_CQP;
+        e->base.cfg=e->cfg; e->base.two_pass_mode=p.i_two_pass;
+        e->base.cq_set=p.i_rc_method==VC1_RC_CQP;
         e->base.bounded_cq=bounded_cq;
         e->base.bounded_maximize=bounded_cq && p.b_rc_maximize;
         e->base.cq_value=p.i_qp_constant; e->base.bounded_preferred_q=p.i_qp_constant;
@@ -3379,9 +3328,11 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         e->base.bframes=p.b_intra_only?0:p.i_bframes;
         e->base.intra_gop_parallelism=p.b_intra_gop_parallelism!=0;
         e->base.intra_gop_workers=e->base.intra_gop_parallelism?std::max(1,std::min(p.i_threads,1+std::max(0,e->base.bframes))):1;
-        e->base.hrd_rate_bits=rate.represented; e->base.hrd_buffer_bits=buffer.represented;
+        e->base.hrd_rate_bits=rate.represented;
+        e->base.target_rate_bits=(p.i_two_pass!=0 || p.i_peak_bitrate)?p.i_bitrate:rate.represented;
+        e->base.hrd_buffer_bits=buffer.represented;
         e->base.rc_i_weight=p.f_rc_i_weight; e->base.rc_p_weight=p.f_rc_p_weight; e->base.rc_b_weight=p.f_rc_b_weight;
-        if (bounded_cq) {
+        if (bounded_cq && (p.i_two_pass!=2 || p.b_bluray_compat)) {
             e->bounded_rate_control=std::make_unique<libvc1::RateController>(rate.represented,buffer.represented,e->cfg.fps);
             e->bounded_current_q=std::clamp(p.i_qp_constant,1,31);
             e->base.bounded_start_q=e->bounded_current_q;
@@ -3389,7 +3340,8 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         e->base.keep_reconstruction=p.b_recon || p.b_transform_info || p.b_debug_stats || p.b_debug_macroblock_stats;
         e->current_gop.reserve(static_cast<size_t>(e->keyint)); e->metadata.reserve(static_cast<size_t>(e->keyint)*2);
         e->stats.i_q_min=32; e->stats.i_q_max=0;
-        e->stats.i_hrd_rate_bits=rate.represented; e->stats.i_hrd_buffer_bits=buffer.represented;
+        e->stats.i_hrd_rate_bits=p.i_two_pass==2 && !p.b_bluray_compat?0:rate.represented;
+        e->stats.i_hrd_buffer_bits=buffer.represented;
         e->stats.i_simd_selected=api_simd(selected);
         e->stats.f_simd_scalar_units_per_second=e->simd_benchmark.scalar_units_per_second;
         e->stats.f_simd_v1_units_per_second=e->simd_benchmark.v1_units_per_second;
@@ -3429,7 +3381,15 @@ int vc1_encoder_encode(vc1_t *e,vc1_au_t **pp_au,int *pi_au,vc1_picture_t *pic_o
             if (pic_in->i_type==VC1_TYPE_P || pic_in->i_type==VC1_TYPE_B) throw std::runtime_error("only AUTO or forced-I input picture types are currently accepted");
             if (pic_in->i_type==VC1_TYPE_I && !e->current_gop.empty()) e->process_dynamic_boundaries(true);
             if (e->current_gop.empty()) { e->current_gop_start=e->frames_received; e->current_gop_starts_scene_i=false; e->current_gop_starts_motion_failure_i=false; }
-            e->current_gop.push_back(copy_input_picture(e->param,*pic_in));
+            auto source=copy_input_picture(e->param,*pic_in);
+            if (e->param.i_two_pass!=0) {
+                const uint64_t fingerprint=vc1_twopass::source_hash(source.y,source.u,source.v);
+                if (e->param.i_two_pass==1) e->source_fingerprints.push_back(fingerprint);
+                else if (e->frames_received>=e->two_pass.by_display.size() ||
+                         fingerprint!=e->two_pass.by_display[static_cast<size_t>(e->frames_received)].hash)
+                    throw std::runtime_error("pass 2 source frame differs from pass 1 or contains extra frames");
+            }
+            e->current_gop.push_back(std::move(source));
             e->metadata.push_back({pic_in->i_pts,pic_in->opaque}); ++e->frames_received;
             if (e->current_gop.size()>=e->keyint) e->process_dynamic_boundaries(false);
             // Keep harvesting completed GOPs even while output is buffered.
@@ -3439,6 +3399,8 @@ int vc1_encoder_encode(vc1_t *e,vc1_au_t **pp_au,int *pi_au,vc1_picture_t *pic_o
             if (e->ready.empty() && e->pending.size()>=e->gop_worker_limit()) e->drain_one();
         } else {
             e->input_finished=true;
+            if (e->param.i_two_pass==2 && e->frames_received!=e->two_pass.by_display.size())
+                throw std::runtime_error("pass 2 frame count differs from pass 1");
             e->process_dynamic_boundaries(true);
             e->plan_window(true);
             e->pump_workers();

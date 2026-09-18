@@ -2,6 +2,49 @@
 
 namespace libvc1 {
 
+void BitWriter::append(const BitWriter& other) {
+        for (uint8_t v : other.data_) bits(v,8);
+        if (other.bits_ > 0) {
+            for (int i=other.bits_-1;i>=0;--i) bit((other.cur_ >> i) & 1u);
+        }
+    }
+std::vector<uint8_t> BitWriter::finish_rbdu() {
+        // VC-1 Advanced Profile RBDU trailing bits: one stop bit followed by zero padding.
+        bit(true);
+        while (bits_ != 0) bit(false);
+        return data_;
+    }
+std::vector<uint8_t> BitWriter::finish_raw() {
+        // Simple/Main Profile frames in ASF are byte-aligned with zero padding;
+        // they are not RBDUs and therefore have no rbdu_stop_one_bit.
+        while (bits_ != 0) bit(false);
+        return data_;
+    }
+
+
+std::vector<uint8_t> escape_ebdu(const std::vector<uint8_t>& in) {
+    std::vector<uint8_t> out;
+    out.reserve(in.size() + in.size()/64 + 8);
+    int zeros = 0;
+    for (uint8_t b : in) {
+        if (zeros >= 2 && b <= 0x03) {
+            out.push_back(0x03);
+            zeros = 0;
+        }
+        out.push_back(b);
+        if (b == 0) ++zeros; else zeros = 0;
+    }
+    return out;
+}
+
+std::vector<uint8_t> bdu(uint8_t suffix, std::vector<uint8_t> rbdu) {
+    auto e = escape_ebdu(rbdu);
+    std::vector<uint8_t> out{0x00,0x00,0x01,suffix};
+    out.insert(out.end(), e.begin(), e.end());
+    return out;
+}
+
+
 using MotionVector = Vc1Encoder::MotionVector;
 using ProgressiveMvMode = Vc1Encoder::ProgressiveMvMode;
 using IntensityComp = Vc1Encoder::IntensityComp;
