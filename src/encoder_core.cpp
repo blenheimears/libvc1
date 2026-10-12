@@ -93,7 +93,7 @@ struct GopEncodeParams {
     double modern_budget_scale=1.0;
     std::vector<double> two_pass_picture_scale;
     // Relative intra/P-inter/B-inter ABR block weights. Normalized over the analyzed GOP block mix.
-    double rc_i_weight=5.0;
+    double rc_i_weight=4.0;
     double rc_p_weight=1.0;
     double rc_b_weight=0.70;
     bool include_sequence=false;
@@ -206,6 +206,12 @@ static double fast_intra_activity(const libvc1::Frame& f,const libvc1::EncoderCo
     // could therefore report near-zero complexity.  Scan every adjacent edge.
     const int ss=1;
     uint64_t h=0,v=0;
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+    if (cfg.simd_for(libvc1::SimdPrimitive::BlockSad)==libvc1::SimdTier::AArch64Neon) {
+        h=libvc1::simd::block_sad_aarch64_neon(f.y.data(),f.width,f.y.data()+1,f.width,f.width-1,f.height,ss);
+        v=libvc1::simd::block_sad_aarch64_neon(f.y.data(),f.width,f.y.data()+f.width,f.width,f.width,f.height-1,ss);
+    } else
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
     if (cfg.simd_for(libvc1::SimdPrimitive::BlockSad)==libvc1::SimdTier::X86V4) {
         h=libvc1::simd::block_sad_x86_64_v4(f.y.data(),f.width,f.y.data()+1,f.width,
@@ -357,7 +363,7 @@ struct AbrRateControl {
     uint64_t gop_frames_total=0;
     uint64_t gop_i_frames=0, gop_p_frames=0, gop_b_frames=0;
     double gop_weight_total_estimate=1.0;
-    double i_weight=5.0, p_weight=1.0, b_weight=0.70;
+    double i_weight=4.0, p_weight=1.0, b_weight=0.70;
     bool initialized=false;
     AbrRateControl(uint64_t rate_bits,uint64_t buffer_bits,libvc1::Rational fps) {
         bitrate=std::max(1.0,static_cast<double>(rate_bits));
@@ -373,7 +379,7 @@ struct AbrRateControl {
         pred[2].coeff_min=0.06; pred[2].coeff=0.23;
     }
     void set_gop_plan(uint64_t n,uint64_t ni,uint64_t np,uint64_t nb,double scale=1.0,
-                      double iw=5.0,double pw=1.0,double bw=0.70) {
+                      double iw=4.0,double pw=1.0,double bw=0.70) {
         gop_frames_total=n; gop_i_frames=ni; gop_p_frames=np; gop_b_frames=nb;
         i_weight=iw; p_weight=pw; b_weight=bw;
         const double weighted=i_weight*static_cast<double>(ni)+p_weight*static_cast<double>(np)+
@@ -1896,6 +1902,9 @@ static vc1_simd_e api_simd(libvc1::SimdTier t) {
         case libvc1::SimdTier::Bulldozer: return VC1_SIMD_BULLDOZER;
         case libvc1::SimdTier::Piledriver: return VC1_SIMD_PILEDRIVER;
         case libvc1::SimdTier::Avx2Partial: return VC1_SIMD_AVX2_PARTIAL;
+        case libvc1::SimdTier::AArch64Neon: return VC1_SIMD_AARCH64_NEON;
+        case libvc1::SimdTier::AArch64Dotprod: return VC1_SIMD_AARCH64_DOTPROD;
+        case libvc1::SimdTier::AArch64Rdm: return VC1_SIMD_AARCH64_RDM;
         default: return VC1_SIMD_NONE;
     }
 }
@@ -1914,6 +1923,9 @@ static libvc1::SimdTier internal_simd(vc1_simd_e t) {
         case VC1_SIMD_BULLDOZER: return libvc1::SimdTier::Bulldozer;
         case VC1_SIMD_PILEDRIVER: return libvc1::SimdTier::Piledriver;
         case VC1_SIMD_AVX2_PARTIAL: return libvc1::SimdTier::Avx2Partial;
+        case VC1_SIMD_AARCH64_NEON: return libvc1::SimdTier::AArch64Neon;
+        case VC1_SIMD_AARCH64_DOTPROD: return libvc1::SimdTier::AArch64Dotprod;
+        case VC1_SIMD_AARCH64_RDM: return libvc1::SimdTier::AArch64Rdm;
         default: return libvc1::SimdTier::None;
     }
 }
@@ -3124,6 +3136,9 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         if (p.b_debug_disable_b_intra!=0 && p.b_debug_disable_b_intra!=1) throw std::runtime_error("debug disable-B-intra flag must be 0 or 1");
         if (p.b_dquant!=0 && p.b_dquant!=1) throw std::runtime_error("DQUANT flag must be 0 or 1");
         if (p.b_overlap!=0 && p.b_overlap!=1) throw std::runtime_error("OVERLAP flag must be 0 or 1");
+        // Keep the normative sequence OVERLAP flag intact even on partial
+        // macroblocks: encode overlap-friendly hidden intra samples instead of
+        // locally suppressing decoder-visible edges or disabling the whole GOP.
         if (p.b_skip_identical_frames!=0 && p.b_skip_identical_frames!=1) throw std::runtime_error("identical-frame skip flag must be 0 or 1");
         if (p.i_bframes<0 || p.i_bframes>2) throw std::runtime_error("B-frame count must be 0..2");
         if (p.i_keyint_max<0) throw std::runtime_error("keyframe interval must be zero (auto) or positive");
@@ -3132,6 +3147,14 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         if (!std::isfinite(p.f_distant_match_max_mae) || p.f_distant_match_max_mae<6.0 || p.f_distant_match_max_mae>255.0)
             throw std::runtime_error("distant-match maximum error must be finite and 6..255 luma MAE");
         if (p.i_me_quality<VC1_ME_SAD || p.i_me_quality>VC1_ME_RD) throw std::runtime_error("motion-estimation quality must be SAD, rate, SATD, or RD");
+        if (p.b_subpixel_refinement!=0 && p.b_subpixel_refinement!=1)
+            throw std::runtime_error("subpixel refinement must be 0 or 1");
+        if (p.b_fast_subpixel_refinement!=0 && p.b_fast_subpixel_refinement!=1)
+            throw std::runtime_error("fast subpixel refinement must be 0 or 1");
+        if (p.i_subpixel_refinement_range<0 || p.i_subpixel_refinement_range>1024)
+            throw std::runtime_error("subpixel refinement range must be 0..1024 pixels");
+        if (p.b_fast_transform_rdo!=0 && p.b_fast_transform_rdo!=1)
+            throw std::runtime_error("fast transform RDO must be 0 or 1");
         // WMV3 / VC-1 Main Profile has an asymmetric maximum motion-vector
         // range: [-1024,1023.75] horizontally but only [-256,255.75]
         // vertically at Main@High. libvc1 exposes one symmetric integer-pixel
@@ -3144,6 +3167,8 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         }
         if (p.i_long_range_search_mode<VC1_LONG_RANGE_COMPARE || p.i_long_range_search_mode>VC1_LONG_RANGE_LEGACY_DISTANT_FIRST)
             throw std::runtime_error("invalid long-range motion-search mode");
+        if (p.i_me_algorithm!=VC1_ME_ALGORITHM_UMH && p.i_me_algorithm!=VC1_ME_ALGORITHM_DIAMOND)
+            throw std::runtime_error("invalid motion-estimation algorithm");
         if (!(p.f_scene_threshold>=0.0 && p.f_scene_threshold<=255.0)) throw std::runtime_error("scene threshold must be 0..255");
         if (!std::isfinite(p.f_scene_cut_min_interval) || p.f_scene_cut_min_interval<0.0 || p.f_scene_cut_min_interval>3600.0)
             throw std::runtime_error("scene cut interval must be finite and 0..3600 seconds");
@@ -3200,7 +3225,8 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
                    m==VC1_SIMD_X86_64_V3 || m==VC1_SIMD_X86_64_V4 ||
                    m==VC1_SIMD_PRESCOTT || m==VC1_SIMD_CONROE ||
                    m==VC1_SIMD_PENRYN || m==VC1_SIMD_SANDYBRIDGE || m==VC1_SIMD_K10 ||
-                   m==VC1_SIMD_BULLDOZER || m==VC1_SIMD_PILEDRIVER || m==VC1_SIMD_AVX2_PARTIAL;
+                   m==VC1_SIMD_BULLDOZER || m==VC1_SIMD_PILEDRIVER || m==VC1_SIMD_AVX2_PARTIAL ||
+                   m==VC1_SIMD_AARCH64_NEON || m==VC1_SIMD_AARCH64_DOTPROD || m==VC1_SIMD_AARCH64_RDM;
         };
         for (int i=0;i<VC1_SIMD_PRIMITIVE_COUNT;++i) {
             const vc1_simd_e m=p.i_simd_primitive[i];
@@ -3226,6 +3252,10 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
                 throw std::runtime_error(std::string("SIMD target ")+libvc1::simd_target_name(requested)+" requested but unavailable on this CPU/build");
             selected=requested;
             dispatch.tier.fill(selected);
+            for (size_t i=0;i<libvc1::kSimdPrimitiveCount;++i)
+                if (!libvc1::simd_target_supports_primitive(selected,static_cast<libvc1::SimdPrimitive>(i)))
+                    dispatch.tier[i]=(requested==libvc1::SimdTier::AArch64Dotprod || requested==libvc1::SimdTier::AArch64Rdm)
+                        ?libvc1::SimdTier::AArch64Neon:libvc1::SimdTier::None;
         }
         auto primitive_fma_capable=[](size_t i){
             const auto primitive=static_cast<libvc1::SimdPrimitive>(i);
@@ -3248,6 +3278,8 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
                 throw std::runtime_error(std::string("SIMD target ")+libvc1::simd_target_name(target)+" is reserved for a future kernel implementation for primitive "+vc1_simd_primitive_name(static_cast<vc1_simd_primitive_e>(i)));
             if (!libvc1::simd_target_available(target))
                 throw std::runtime_error(std::string("SIMD target ")+libvc1::simd_target_name(target)+" override requested but unavailable for primitive "+vc1_simd_primitive_name(static_cast<vc1_simd_primitive_e>(i)));
+            if (!libvc1::simd_target_supports_primitive(target,static_cast<libvc1::SimdPrimitive>(i)))
+                throw std::runtime_error(std::string("SIMD target ")+libvc1::simd_target_name(target)+" has no kernel for primitive "+vc1_simd_primitive_name(static_cast<vc1_simd_primitive_e>(i)));
             dispatch.tier[i]=target;
             dispatch.fma[i]=p.b_simd_fma && libvc1::simd_target_fma_capable(target) && primitive_fma_capable(i);
         }
@@ -3276,8 +3308,9 @@ vc1_t *vc1_encoder_open(const vc1_param_t *input) {
         e->cfg.quantizer_type=p.i_quantizer_type==VC1_QUANTIZER_NONUNIFORM?libvc1::QuantizerType::NonUniform:(p.i_quantizer_type==VC1_QUANTIZER_UNIFORM?libvc1::QuantizerType::Uniform:libvc1::QuantizerType::Auto);
         e->cfg.ac_coding=p.b_ac_coding!=0; e->cfg.ac_mode=internal_ac_mode(p.i_ac_mode);
         e->cfg.ac_y_table_index=p.i_ac_y_table; e->cfg.ac_c_table_index=p.i_ac_c_table;
-        e->cfg.motion_search_range=p.i_motion_search_range; e->cfg.motion_local_search_range=std::min(p.i_motion_local_search_range,p.i_motion_search_range); e->cfg.me_quality=p.i_me_quality; e->cfg.long_range_search_mode=p.i_long_range_search_mode; e->cfg.distant_match_max_mae=p.f_distant_match_max_mae; e->cfg.scene_threshold=p.f_scene_threshold;
+        e->cfg.motion_search_range=p.i_motion_search_range; e->cfg.motion_local_search_range=std::min(p.i_motion_local_search_range,p.i_motion_search_range); e->cfg.me_algorithm=p.i_me_algorithm; e->cfg.me_quality=p.i_me_quality; e->cfg.subpixel_refinement=(p.b_subpixel_refinement!=0); e->cfg.fast_subpixel_refinement=(p.b_fast_subpixel_refinement!=0); e->cfg.subpixel_refinement_range=p.i_subpixel_refinement_range; e->cfg.long_range_search_mode=p.i_long_range_search_mode; e->cfg.distant_match_max_mae=p.f_distant_match_max_mae; e->cfg.scene_threshold=p.f_scene_threshold;
         e->cfg.fade_compensation=p.b_fade_compensation!=0; e->cfg.variable_transforms=p.b_variable_transforms!=0;
+        e->cfg.fast_transform_rdo=p.b_fast_transform_rdo!=0;
         e->cfg.dquant=(p.b_dquant!=0);
         e->cfg.loop_filter=p.b_loop_filter!=0; e->cfg.overlap=p.b_overlap!=0; e->cfg.trellis=p.i_trellis;
         e->cfg.adaptive_quality=p.b_adaptive_quality!=0; e->cfg.aq_strength=p.f_aq_strength;

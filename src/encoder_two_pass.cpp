@@ -31,6 +31,7 @@ uint64_t signature(const vc1_param_t& p) {
      <<p.i_long_range_search_mode<<' '<<p.f_distant_match_max_mae<<' '
      <<p.b_fade_compensation<<' '<<p.b_loop_filter<<' '<<p.b_overlap<<' '
      <<p.b_variable_transforms<<' '<<p.b_dquant<<' '<<p.i_trellis<<' '
+     <<p.i_me_algorithm<<' '<<p.b_subpixel_refinement<<' '<<p.b_fast_transform_rdo<<' '<<p.b_fast_subpixel_refinement<<' '<<p.i_subpixel_refinement_range<<' '
      <<p.b_adaptive_quality<<' '<<p.f_aq_strength<<' '<<p.i_ac_mode<<' '
      <<p.b_ac_coding<<' '<<p.i_ac_y_table<<' '<<p.i_ac_c_table<<' '
      <<p.i_quantizer_type<<' '<<p.b_halfqp<<' '<<p.f_rc_residual_threshold<<' '
@@ -58,22 +59,21 @@ BudgetLedger::BudgetLedger(const Plan& plan,uint64_t bitrate,int fps_num,int fps
                 throw std::runtime_error("invalid two-pass GOP budget");
             nominal.push_back(bits);
         }
+        // read_plan() has already normalized every GOP against the complete
+        // first-pass file. Keep those whole-video targets immutable in pass 2:
+        // actual overshoot in an early GOP must not be converted into a lower
+        // quality multiplier for later GOPs (especially a short final GOP).
+        // VBV remains authoritative inside each GOP and may still force a
+        // coarser quantizer when the decoder buffer genuinely requires it.
         reserved_by_gop.assign(nominal.size(),0.0);
-        suffix.assign(nominal.size()+1,0.0);
-        for (size_t i=nominal.size();i-->0;) suffix[i]=suffix[i+1]+nominal[i];
     }
 double BudgetLedger::launch(size_t index) {
         if (index!=launched || launched>=nominal.size())
             throw std::runtime_error("two-pass budget launch order mismatch");
-        // All uncommitted jobs are already reserved.  Redistribute any global
-        // size error over *all* unlaunched pictures, not the immediately next
-        // GOP.  No artificial per-scene ceiling is introduced here.
-        const double available=target_bits-actual_bits-reserved_bits;
-        const double multiplier=std::max(1e-9,available/std::max(1e-9,suffix[launched]));
-        reserved_by_gop[index]=nominal[index]*multiplier;
-        reserved_bits+=reserved_by_gop[index];
+        reserved_by_gop[index]=nominal[index];
+        reserved_bits+=nominal[index];
         ++launched;
-        return multiplier;
+        return 1.0;
     }
 void BudgetLedger::commit(size_t index,double bits) {
         if (index!=committed || index>=launched || !std::isfinite(bits) || bits<0.0)

@@ -568,6 +568,9 @@ static const char* simd_name(vc1_simd_e s) {
         case VC1_SIMD_PENRYN:return "penryn"; case VC1_SIMD_SANDYBRIDGE:return "sandybridge";
         case VC1_SIMD_K10:return "k10"; case VC1_SIMD_BULLDOZER:return "bulldozer";
         case VC1_SIMD_PILEDRIVER:return "piledriver"; case VC1_SIMD_AVX2_PARTIAL:return "avx2-partial";
+        case VC1_SIMD_AARCH64_NEON:return "aarch64-neon";
+        case VC1_SIMD_AARCH64_DOTPROD:return "aarch64-dotprod";
+        case VC1_SIMD_AARCH64_RDM:return "aarch64-rdm";
         case VC1_SIMD_AUTO:return "auto"; default:return "none";
     }
 }
@@ -619,7 +622,10 @@ static vc1_simd_e parse_simd_tier(std::string v,const char* opt,bool allow_auto=
     if(v=="bulldozer")return VC1_SIMD_BULLDOZER;
     if(v=="piledriver")return VC1_SIMD_PILEDRIVER;
     if(v=="avx2-partial"||v=="avx2_partial")return VC1_SIMD_AVX2_PARTIAL;
-    throw std::runtime_error(std::string(opt)+" must use auto, none (scalar alias), x86-64-v1, x86-64-v2, x86-64-v3, x86-64-v4, or a named x86 target");
+    if(v=="aarch64-neon"||v=="arm64-neon"||v=="neon")return VC1_SIMD_AARCH64_NEON;
+    if(v=="aarch64-dotprod"||v=="arm64-dotprod"||v=="dotprod")return VC1_SIMD_AARCH64_DOTPROD;
+    if(v=="aarch64-rdm"||v=="arm64-rdm"||v=="rdm")return VC1_SIMD_AARCH64_RDM;
+    throw std::runtime_error(std::string(opt)+" must use auto, none (scalar alias), x86-64-v1, x86-64-v2, x86-64-v3, x86-64-v4, aarch64-neon, aarch64-dotprod, aarch64-rdm, or a named x86 target");
 }
 
 static int find_simd_primitive(std::string name) {
@@ -683,7 +689,7 @@ RATE CONTROL
   --dynamic-ipb-weights        Adapt I/P/B weights in pass 2 (default: on).
   --no-dynamic-ipb-weights     Keep the configured I/P/B baseline weights.
   --dynamic-ipb-strength X     Adaptation strength, 0..2 (default: 1).
-  --i-block-weight X           Baseline intra-MB weight (default: 5.0).
+  --i-block-weight X           Baseline intra-MB weight (default: 4.0).
   --p-block-weight X           Baseline P-MB weight (default: 1.0).
   --b-block-weight X           Baseline B-MB weight (default: 0.70).
   --residual-priority-threshold X  Poor-prediction protection begins here (8).
@@ -705,7 +711,13 @@ GOP AND MOTION ESTIMATION
   --fixed-gop-grid             Suppress unscheduled adaptive I pictures.
   --search-range N             Maximum motion-search radius (default: 1024).
   --local-search-range N       Local search radius (default: 32).
+  --me-algorithm MODE           umh|diamond (default: umh; progressive local ME).
   --me-quality MODE            sad|rate|satd|rd (default: satd).
+  --subpixel-refinement        Enable fractional ME refinement (default).
+  --no-subpixel-refinement     Keep integer MVs; skip fractional refinement.
+  --fast-subpixel-refinement   Fractional search with adaptive diamond stencil and four SATD finalists.
+  --full-subpixel-refinement   Restore full fractional candidate analysis.
+  --subpixel-range N          Refine only MVs within +/-N pixels on each axis (0..1024; default 1024).
   --long-range-search MODE     compare|local-good|legacy (default: compare).
   --distant-match-max-error X  Maximum distant-match luma MAE (default: 255).
 
@@ -717,6 +729,9 @@ CODING TOOLS
   --no-loop-filter             Disable in-loop deblocking.
   --no-fade-comp               Disable intensity/fade compensation.
   --fixed-8x8                  Disable variable inter transforms.
+  --variable-transforms        Enable variable inter transforms (default).
+  --fast-transform-rdo         Heuristic transform choice; skip multi-candidate RDO (faster).
+  --full-transform-rdo         Restore full distortion/bit estimates (default).
   --skip-identical-frames      Enable normative skipped pictures (default).
   --no-skip-identical-frames   Disable skipped-picture optimization.
   --dc-only                    Enable DC-only transform coding.
@@ -724,8 +739,14 @@ CODING TOOLS
   --ac-y-table 0|1|2           Luma AC VLC table (requires --ac-mode vlc).
   --ac-c-table 0|1|2           Chroma AC VLC table (requires --ac-mode vlc).
 
+CONTENT PRESETS
+  --animation                  Set I-block weight to 5 (animation baseline).
+  --film                       Set I-block weight to 3 (film baseline).
+  --grain                      Alias of --film (I=3; reserved for future tuning).
+                               Only I weight changes; later options override it.
+
 PERFORMANCE AND COMPUTE
-  --fast / --faster / --fastest Select a speed preset; later options override it.
+  --fast                       Throughput preset; later options override it.
   --threads N                  Number of encoding threads.
   --intra-gop-parallelism      Enable extra work inside each GOP (off by default).
   --no-intra-gop-parallelism   Disable intra-GOP work explicitly.
@@ -733,8 +754,9 @@ PERFORMANCE AND COMPUTE
   --compute-device N           Vulkan physical-device index.
   --vulkan-min-batch N         Minimum Vulkan dispatch batch size.
   --vulkan-force               Force eligible Vulkan work without speed win.
-  --simd TIER                  auto|none|x86-64-v1|prescott|k10|conroe|
-                               penryn|x86-64-v2|sandybridge|bulldozer|
+  --simd TIER                  auto|none|aarch64-neon|aarch64-dotprod|aarch64-rdm|
+                               x86-64-v1|prescott|k10|conroe|penryn|x86-64-v2|
+                               sandybridge|bulldozer|
                                piledriver|avx2-partial|x86-64-v3|x86-64-v4
   --benchmark-all              Benchmark all compatible SIMD tiers (default).
   --benchmark-selective        Benchmark only selected intermediate tiers.
@@ -852,10 +874,15 @@ static void write_speed_profile_report(const std::string& path,const vc1_param_t
     out<<"preset="<<preset<<"\n";
     out<<"settings: bframes="<<(p.b_intra_only?0:p.i_bframes)
        <<" search="<<p.i_motion_search_range<<" local_search="<<p.i_motion_local_search_range
+       <<" me_algorithm="<<(p.i_me_algorithm==VC1_ME_ALGORITHM_DIAMOND?"diamond":"umh")
+       <<" subpixel_refinement="<<(p.b_subpixel_refinement?"on":"off")
+       <<" subpixel_mode="<<(p.b_subpixel_refinement?(p.b_fast_subpixel_refinement?"fast":"full"):"off")
+       <<" subpixel_range="<<p.i_subpixel_refinement_range
        <<" me="<<(p.i_me_quality==VC1_ME_RD?"rd":(p.i_me_quality==VC1_ME_SATD?"satd":(p.i_me_quality==VC1_ME_RATE?"rate":"sad")))
        <<" trellis="<<p.i_trellis<<" aq="<<(p.b_adaptive_quality?"on":"off")
        <<" dquant="<<(p.b_dquant?"on":"off")
        <<" variable_transforms="<<(p.b_variable_transforms?"on":"off")
+       <<" fast_transform_rdo="<<(p.b_fast_transform_rdo?"on":"off")
        <<" overlap="<<(p.b_overlap?"on":"off")
        <<" loop_filter="<<(p.b_loop_filter?"on":"off")
        <<" fade_comp="<<(p.b_fade_compensation?"on":"off")
@@ -903,7 +930,10 @@ int main(int argc,char** argv) {
         std::string speed_preset="normal";
         bool bitrate_set=false,buffer_set=false,cq_set=false,rc_maximize_set=false,rc_weights_set=false,codec_set=false;
         bool y_table_set=false,c_table_set=false,keyint_set=false;
-        auto apply_speed_preset=[&](int level) {
+        auto apply_fast_preset=[&]() {
+            // This is the former --faster policy with the exact motion overrides
+            // used for 1080p throughput tests. Later CLI arguments still win.
+            speed_preset="fast";
             param.b_fade_compensation=0;
             param.i_trellis=0;
             param.b_adaptive_quality=0;
@@ -913,34 +943,23 @@ int main(int argc,char** argv) {
             param.i_ac_c_table=1;
             y_table_set=false;
             c_table_set=false;
-            if (level==1) {
-                speed_preset="fast";
-                param.i_motion_search_range=8;
-                param.i_motion_local_search_range=8;
-                param.i_me_quality=VC1_ME_SATD;
-                param.b_scene_cut=0;
-                param.b_loop_filter=1;
-                param.b_overlap=1;
-                param.b_variable_transforms=1;
-            } else if (level==2) {
-                speed_preset="faster";
-                param.i_motion_search_range=4;
-                param.i_motion_local_search_range=4;
-                param.i_me_quality=VC1_ME_RATE;
-                param.b_scene_cut=0;
-                param.b_loop_filter=1;
-                param.b_overlap=1;
-                param.b_variable_transforms=0;
-            } else {
-                speed_preset="fastest";
-                param.i_motion_search_range=0;
-                param.i_motion_local_search_range=0;
-                param.i_me_quality=VC1_ME_SAD;
-                param.b_scene_cut=0;
-                param.b_loop_filter=0;
-                param.b_overlap=0;
-                param.b_variable_transforms=0;
-            }
+            // B-motion analysis now reuses the global search, content index,
+            // intensity-compensated reference and SIMD prediction blocks.
+            // Preserve B-frame coding quality in the throughput preset.
+            param.i_bframes=2;
+            param.b_scene_cut=0;
+            param.b_loop_filter=1;
+            param.b_overlap=1;
+            param.b_variable_transforms=1;
+            param.b_fast_transform_rdo=1;
+            param.i_motion_search_range=1024;
+            param.i_motion_local_search_range=8;
+            param.i_me_algorithm=VC1_ME_ALGORITHM_DIAMOND;
+            param.i_long_range_search_mode=VC1_LONG_RANGE_LOCAL_GOOD_SKIP;
+            param.i_me_quality=VC1_ME_SAD;
+            param.b_subpixel_refinement=1;
+            param.b_fast_subpixel_refinement=1;
+            param.i_subpixel_refinement_range=16;
         };
         for(int i=1;i<argc;++i){ std::string a=argv[i]; auto need=[&](const char* o){if(++i>=argc)throw std::runtime_error(std::string("missing value for ")+o);return std::string(argv[i]);};
             if(a=="-i")inpath=need("-i"); else if(a=="-o")outpath=need("-o");
@@ -954,7 +973,10 @@ int main(int argc,char** argv) {
             else if(a=="--es-out")espath=need("--es-out"); else if(a=="--recon-out")reconpath=need("--recon-out"); else if(a=="--debug-transforms"||a=="--transform-overlay")transformpath=need(a.c_str()); else if(a=="--rc-stats")rcstatspath=need("--rc-stats"); else if(a=="--debug-stats")debugstatspath=need("--debug-stats"); else if(a=="--macroblock-stats"||a=="--mb-stats")macroblockstatspath=need(a.c_str()); else if(a=="--speed-profile"||a=="--profile-speed"){speedprofilepath=need(a.c_str());param.b_speed_profile=1;}
             else if(a=="--input-fps"||a=="--fps"){input_fps_override=parse_fps_value(need(a.c_str()),a.c_str());input_fps_override_set=true;}
             else if(a=="--max-frames")maxframes=std::stoll(need("--max-frames")); else if(a=="--threads")param.i_threads=std::stoi(need("--threads")); else if(a=="--no-intra-gop-parallelism")param.b_intra_gop_parallelism=0; else if(a=="--intra-gop-parallelism")param.b_intra_gop_parallelism=1;
-            else if(a=="--fast")apply_speed_preset(1); else if(a=="--faster")apply_speed_preset(2); else if(a=="--fastest")apply_speed_preset(3);
+            else if(a=="--animation") { param.f_rc_i_weight=5.0; rc_weights_set=true; }
+            else if(a=="--film"||a=="--grain") { param.f_rc_i_weight=3.0; rc_weights_set=true; }
+            else if(a=="--fast")apply_fast_preset();
+            else if(a=="--faster"||a=="--fastest")throw std::runtime_error(a+" was removed in 0.2.67; use --fast or explicit coding options");
             else if(a=="--compute"){auto v=need("--compute");if(v=="auto")param.i_compute_backend=VC1_COMPUTE_AUTO;else if(v=="cpu"||v=="none")param.i_compute_backend=VC1_COMPUTE_CPU;else if(v=="vulkan"||v=="vk")param.i_compute_backend=VC1_COMPUTE_VULKAN;else throw std::runtime_error("--compute must be auto, cpu, or vulkan");}
             else if(a=="--compute-device"||a=="--vulkan-device")param.i_compute_device=std::stoi(need(a.c_str()));
             else if(a=="--vulkan-min-batch")param.i_vulkan_min_batch=std::stoi(need("--vulkan-min-batch"));
@@ -965,15 +987,23 @@ int main(int argc,char** argv) {
             else if(a=="--simd-primitive"||a=="--simd-primitives")apply_simd_primitive_overrides(param,need(a.c_str()));
             else if(a=="--no-simd")param.i_simd=VC1_SIMD_NONE; else if(a=="--simd-fma"||a=="--fma3")param.b_simd_fma=1; else if(a=="--no-simd-fma")param.b_simd_fma=0;
             else if(a=="--bframes")param.i_bframes=std::stoi(need("--bframes"));
+            else if(a=="--subpixel-refinement"||a=="--subpel")param.b_subpixel_refinement=1;
+            else if(a=="--no-subpixel-refinement"||a=="--no-subpel")param.b_subpixel_refinement=0;
+            else if(a=="--fast-subpixel-refinement") {param.b_subpixel_refinement=1;param.b_fast_subpixel_refinement=1;}
+            else if(a=="--full-subpixel-refinement") {param.b_subpixel_refinement=1;param.b_fast_subpixel_refinement=0;}
+            else if(a=="--subpixel-range"||a=="--subpixel-refinement-range") param.i_subpixel_refinement_range=std::stoi(need(a.c_str()));
+            else if(a=="--fast-transform-rdo")param.b_fast_transform_rdo=1;
+            else if(a=="--full-transform-rdo")param.b_fast_transform_rdo=0;
             else if(a=="--bluray-compat")param.b_bluray_compat=1; else if(a=="--no-bluray-compat")param.b_bluray_compat=0;
             else if(a=="--max-bitrate"){param.i_peak_bitrate=parse_bitrate_value(need("--max-bitrate"),"--max-bitrate");} else if(a=="--bitrate"){param.i_bitrate=parse_bitrate_value(need("--bitrate"),"--bitrate");bitrate_set=true;} else if(a=="--buffer-size"){param.i_vbv_buffer_size=parse_bitrate_value(need("--buffer-size"),"--buffer-size");buffer_set=true;} else if(a=="--rc-maximize"||a=="--maximize-bitrate"||a=="--max-utilization"){param.b_rc_maximize=1;rc_maximize_set=true;} else if(a=="--i-frame-weight"||a=="--i-block-weight"||a=="--rc-i-weight"){param.f_rc_i_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--p-frame-weight"||a=="--p-block-weight"||a=="--rc-p-weight"){param.f_rc_p_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--b-frame-weight"||a=="--b-block-weight"||a=="--rc-b-weight"){param.f_rc_b_weight=std::stod(need(a.c_str()));rc_weights_set=true;} else if(a=="--residual-priority-threshold"||a=="--poor-prediction-threshold"){param.f_rc_residual_threshold=std::stod(need(a.c_str()));} else if(a=="--residual-priority-width"||a=="--poor-prediction-width"){param.f_rc_residual_width=std::stod(need(a.c_str()));} else if(a=="--residual-priority-strength"||a=="--poor-prediction-boost"){param.f_rc_residual_max_q_boost=std::stod(need(a.c_str()));} else if(a=="--inter-intra-threshold"||a=="--intra-block-threshold"){param.f_inter_intra_threshold=std::stod(need(a.c_str()));} else if(a=="--cq"||a=="--quantizer"){double q=std::stod(need(a.c_str())); double iq=std::floor(q); double frac=q-iq; if(q<1.0||q>31.0||!(std::abs(frac)<1e-9||std::abs(frac-0.5)<1e-9)|| (frac>0.25&&iq>8.0)) throw std::runtime_error("--cq must be an integer 1..31 or a half step 1.5..8.5"); param.i_qp_constant=static_cast<int>(iq); param.b_qp_half=frac>0.25?1:0; param.i_rc_method=VC1_RC_CQP;cq_set=true;} else if(a=="--quantizer-type"){std::string q=need("--quantizer-type"); if(q=="auto")param.i_quantizer_type=VC1_QUANTIZER_AUTO; else if(q=="uniform")param.i_quantizer_type=VC1_QUANTIZER_UNIFORM; else if(q=="nonuniform")param.i_quantizer_type=VC1_QUANTIZER_NONUNIFORM; else throw std::runtime_error("--quantizer-type must be auto, uniform, or nonuniform");} else if(a=="--no-halfqp"){param.b_halfqp=0;}
             else if(a=="--keyint"){param.i_keyint_max=std::stoi(need("--keyint"));keyint_set=true;} else if(a=="--search-range")param.i_motion_search_range=std::stoi(need("--search-range")); else if(a=="--local-search-range"||a=="--local-search")param.i_motion_local_search_range=std::stoi(need(a.c_str()));
+            else if(a=="--me-algorithm"||a=="--motion-search-algorithm") {const auto v=need(a.c_str());if(v=="umh")param.i_me_algorithm=VC1_ME_ALGORITHM_UMH;else if(v=="diamond")param.i_me_algorithm=VC1_ME_ALGORITHM_DIAMOND;else throw std::runtime_error("--me-algorithm must be umh or diamond");}
             else if(a=="--me-quality"||a=="--motion-quality"){auto v=need(a.c_str());if(v=="sad")param.i_me_quality=VC1_ME_SAD;else if(v=="rate"||v=="sad-rate")param.i_me_quality=VC1_ME_RATE;else if(v=="satd")param.i_me_quality=VC1_ME_SATD;else if(v=="rd"||v=="rdo")param.i_me_quality=VC1_ME_RD;else throw std::runtime_error("--me-quality must be sad, rate, satd, or rd");}
             else if(a=="--long-range-search"||a=="--distant-search-mode"){auto v=need(a.c_str());if(v=="compare"||v=="best")param.i_long_range_search_mode=VC1_LONG_RANGE_COMPARE;else if(v=="local-good"||v=="local-first")param.i_long_range_search_mode=VC1_LONG_RANGE_LOCAL_GOOD_SKIP;else if(v=="legacy"||v=="distant-first")param.i_long_range_search_mode=VC1_LONG_RANGE_LEGACY_DISTANT_FIRST;else throw std::runtime_error("--long-range-search must be compare, local-good, or legacy");}
             else if(a=="--distant-match-max-error"||a=="--distant-match-max-mae")param.f_distant_match_max_mae=std::stod(need(a.c_str()));
             else if(a=="--legacy-distant-first")param.i_long_range_search_mode=VC1_LONG_RANGE_LEGACY_DISTANT_FIRST; else if(a=="--local-good-short-circuit")param.i_long_range_search_mode=VC1_LONG_RANGE_LOCAL_GOOD_SKIP; else if(a=="--compare-local-distant")param.i_long_range_search_mode=VC1_LONG_RANGE_COMPARE;
             else if(a=="--scene-cut"||a=="--scene-detect")param.b_scene_cut=1; else if(a=="--scene-threshold")param.f_scene_threshold=std::stod(need("--scene-threshold")); else if(a=="--scene-cut-interval"||a=="--scene-cut-min-interval")param.f_scene_cut_min_interval=std::stod(need(a.c_str())); else if(a=="--fixed-gop-grid"||a=="--fixed-keyframe-grid"||a=="--fixed-keyint-grid")param.b_fixed_gop_grid=1; else if(a=="--reset-gop-on-scene")param.b_fixed_gop_grid=0; else if(a=="--no-scene-cut")param.b_scene_cut=0; else if(a=="--no-fade-comp"||a=="--no-intensity-comp")param.b_fade_compensation=0; else if(a=="--no-loop-filter"||a=="--no-deblock")param.b_loop_filter=0; else if(a=="--overlap")param.b_overlap=1; else if(a=="--no-overlap")param.b_overlap=0;
-            else if(a=="--trellis")param.i_trellis=std::stoi(need("--trellis")); else if(a=="--no-trellis")param.i_trellis=0; else if(a=="--aq-strength")param.f_aq_strength=std::stod(need("--aq-strength")); else if(a=="--no-aq"||a=="--no-adaptive-quality")param.b_adaptive_quality=0; else if(a=="--dquant")param.b_dquant=1; else if(a=="--no-dquant")param.b_dquant=0; else if(a=="--fixed-8x8"||a=="--no-variable-transforms")param.b_variable_transforms=0; else if(a=="--skip-identical-frames"||a=="--skip-duplicate-frames")param.b_skip_identical_frames=1; else if(a=="--no-skip-identical-frames"||a=="--no-skip-duplicate-frames")param.b_skip_identical_frames=0; else if(a=="--debug-disable-p-intra"||a=="--debug-no-p-intra")param.b_debug_disable_p_intra=1; else if(a=="--debug-disable-b-intra"||a=="--debug-no-b-intra")param.b_debug_disable_b_intra=1; else if(a=="--debug-disable-pb-intra"||a=="--debug-no-pb-intra"||a=="--debug-disable-inter-picture-intra"){param.b_debug_disable_p_intra=1;param.b_debug_disable_b_intra=1;} else if(a=="--intra-only")param.b_intra_only=1; else if(a=="--dc-only")param.b_ac_coding=0;
+            else if(a=="--trellis")param.i_trellis=std::stoi(need("--trellis")); else if(a=="--no-trellis")param.i_trellis=0; else if(a=="--aq-strength")param.f_aq_strength=std::stod(need("--aq-strength")); else if(a=="--no-aq"||a=="--no-adaptive-quality")param.b_adaptive_quality=0; else if(a=="--dquant")param.b_dquant=1; else if(a=="--no-dquant")param.b_dquant=0; else if(a=="--fixed-8x8"||a=="--no-variable-transforms")param.b_variable_transforms=0; else if(a=="--variable-transforms")param.b_variable_transforms=1; else if(a=="--skip-identical-frames"||a=="--skip-duplicate-frames")param.b_skip_identical_frames=1; else if(a=="--no-skip-identical-frames"||a=="--no-skip-duplicate-frames")param.b_skip_identical_frames=0; else if(a=="--debug-disable-p-intra"||a=="--debug-no-p-intra")param.b_debug_disable_p_intra=1; else if(a=="--debug-disable-b-intra"||a=="--debug-no-b-intra")param.b_debug_disable_b_intra=1; else if(a=="--debug-disable-pb-intra"||a=="--debug-no-pb-intra"||a=="--debug-disable-inter-picture-intra"){param.b_debug_disable_p_intra=1;param.b_debug_disable_b_intra=1;} else if(a=="--intra-only")param.b_intra_only=1; else if(a=="--dc-only")param.b_ac_coding=0;
             else if(a=="--ac-mode"){auto v=need("--ac-mode");if(v=="auto")param.i_ac_mode=VC1_AC_AUTO;else if(v=="vlc")param.i_ac_mode=VC1_AC_VLC;else if(v=="esc3")param.i_ac_mode=VC1_AC_ESC3;else throw std::runtime_error("--ac-mode must be auto, vlc, or esc3");}
             else if(a=="--ac-y-table"){param.i_ac_y_table=std::stoi(need("--ac-y-table"));y_table_set=true;} else if(a=="--ac-c-table"){param.i_ac_c_table=std::stoi(need("--ac-c-table"));c_table_set=true;} else if(a=="--ac-esc3-only")param.i_ac_mode=VC1_AC_ESC3;
             else if(a=="-h"||a=="--help"){usage(argv[0]);return 0;} else throw std::runtime_error("unknown option: "+a);
@@ -1063,10 +1093,21 @@ int main(int argc,char** argv) {
                 {VC1_SIMD_BENCH_AVX2_PARTIAL,"AVX2-PARTIAL",VC1_SIMD_AVX2_PARTIAL,false},
                 {VC1_SIMD_BENCH_X86_64_V3,"X86-64-V3",VC1_SIMD_X86_64_V3,true},
                 {VC1_SIMD_BENCH_X86_64_V4,"X86-64-V4",VC1_SIMD_X86_64_V4,true},
+                {VC1_SIMD_BENCH_AARCH64_NEON,"AARCH64-NEON",VC1_SIMD_AARCH64_NEON,false},
+                {VC1_SIMD_BENCH_AARCH64_DOTPROD,"AARCH64-DOTPROD",VC1_SIMD_AARCH64_DOTPROD,false},
+                {VC1_SIMD_BENCH_AARCH64_RDM,"AARCH64-RDM",VC1_SIMD_AARCH64_RDM,false},
             };
             auto slot_has_rate=[&](int slot){ for(int pi=0;pi<VC1_SIMD_PRIMITIVE_COUNT;++pi) if(initial.f_simd_primitive_units_per_second[pi][slot]>0.0)return true; return false; };
+            // Retain the historic generic x86 columns on x86 only. On ARM show
+            // the available NEON column without empty x86-64-v1/v2/v3/v4 columns.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
+            constexpr bool x86_host = true;
+#else
+            constexpr bool x86_host = false;
+#endif
             std::vector<const Column*> columns;
-            for(const auto& c:all_columns) if(c.generic || slot_has_rate(c.slot)) columns.push_back(&c);
+            for (const auto& c : all_columns)
+                if (slot_has_rate(c.slot) || (x86_host && c.generic)) columns.push_back(&c);
             auto pct_width=[&](const char* label){return std::max(kPctMinW,static_cast<int>(std::strlen(label))+1);};
             auto print_rate=[](double r){
                 if(r>0.0)std::cerr<<std::right<<std::setw(kRateW)<<std::fixed<<std::setprecision(2)<<r;
@@ -1093,6 +1134,9 @@ int main(int argc,char** argv) {
                   case VC1_SIMD_AVX2_PARTIAL: return VC1_SIMD_BENCH_AVX2_PARTIAL;
                   case VC1_SIMD_X86_64_V3: return VC1_SIMD_BENCH_X86_64_V3;
                   case VC1_SIMD_X86_64_V4: return VC1_SIMD_BENCH_X86_64_V4;
+                  case VC1_SIMD_AARCH64_NEON: return VC1_SIMD_BENCH_AARCH64_NEON;
+                  case VC1_SIMD_AARCH64_DOTPROD: return VC1_SIMD_BENCH_AARCH64_DOTPROD;
+                  case VC1_SIMD_AARCH64_RDM: return VC1_SIMD_BENCH_AARCH64_RDM;
                   default: return -1;
                 }
             };
@@ -1114,14 +1158,39 @@ int main(int argc,char** argv) {
                 std::cerr<<"  "<<std::left<<std::setw(kSelectedW)<<selected; print_pct(selected_rate,rn,kSelectedPctW); std::cerr<<"\n";
                 if(selected_rate>0.0 && rn>0.0){selected_ratio_logsum+=std::log(selected_rate/rn);++selected_ratio_count;}
             }
-            auto gmean_slot=[&](int slot){long double ls=0.0L;int n=0;for(int pi=0;pi<VC1_SIMD_PRIMITIVE_COUNT;++pi){double r=initial.f_simd_primitive_units_per_second[pi][slot];if(r>0){ls+=std::log(r);++n;}}return n?std::exp(static_cast<double>(ls/n)):0.0;};
+            auto gmean_slot=[&](int slot){long double ls=0.0L;int n=0;for(int pi=0;pi<VC1_SIMD_PRIMITIVE_COUNT;++pi){const double r=initial.f_simd_primitive_units_per_second[pi][slot];if(r>0){ls+=std::log(r);++n;}}return n?std::exp(static_cast<double>(ls/n)):0.0;};
+            // A partial ISA covers only its own kernels. Compare *paired*
+            // primitive ratios, never the gmean of its subset's raw units/s
+            // against the gmean of all scalar primitives (different units).
+            auto paired_ratio=[&](int numerator,int denominator,int& n){
+                long double ls=0.0L;n=0;
+                for(int pi=0;pi<VC1_SIMD_PRIMITIVE_COUNT;++pi){
+                    const double a=initial.f_simd_primitive_units_per_second[pi][numerator];
+                    const double b=initial.f_simd_primitive_units_per_second[pi][denominator];
+                    if(a>0.0 && b>0.0){ls+=std::log(a/b);++n;}
+                }
+                return n?std::exp(static_cast<double>(ls/n)):0.0;
+            };
             const double gn=gmean_slot(VC1_SIMD_BENCH_NONE);
             std::cerr<<std::left<<std::setw(kModeW)<<"[auto]"<<std::setw(kPrimW)<<"geometric-mean"; print_rate(gn);
-            for(const Column* c:columns){double g=gmean_slot(c->slot);print_pct(g,gn,pct_width(c->label));}
+            for(const Column* c:columns){int n=0;const double ratio=paired_ratio(c->slot,VC1_SIMD_BENCH_NONE,n);print_pct(ratio,1.0,pct_width(c->label));}
             std::cerr<<"  "<<std::left<<std::setw(kSelectedW)<<"-";
             if(selected_ratio_count>0){const double pct=100.0*std::exp(static_cast<double>(selected_ratio_logsum/selected_ratio_count));std::ostringstream os;os<<std::fixed<<std::setprecision(1)<<pct<<'%';std::cerr<<std::right<<std::setw(kSelectedPctW)<<os.str();}
             else std::cerr<<std::right<<std::setw(kSelectedPctW)<<"n/a";
             std::cerr<<std::defaultfloat<<"\n";
+            // Separate ARM extension comparison uses exactly the primitives
+            // implemented by each extension, paired against baseline NEON.
+            for(const Column* c:columns){
+                if(c->slot!=VC1_SIMD_BENCH_AARCH64_DOTPROD && c->slot!=VC1_SIMD_BENCH_AARCH64_RDM)continue;
+                int n=0, scalar_n=0;
+                const double ratio=paired_ratio(c->slot,VC1_SIMD_BENCH_AARCH64_NEON,n);
+                paired_ratio(c->slot,VC1_SIMD_BENCH_NONE,scalar_n);
+                if(!scalar_n)continue;
+                std::cerr<<"vc1enc: ARM "<<c->label<<" paired vs NEON: ";
+                if(n){std::cerr<<std::fixed<<std::setprecision(1)<<100.0*ratio<<"% ("<<n<<" primitives)";}
+                else std::cerr<<"n/a";
+                std::cerr<<std::defaultfloat<<"\n";
+            }
         } else if(any_simd_override) {
             constexpr int kModeW=10, kPrimW=24, kSelectedW=18;
             std::cerr<<"vc1enc: SIMD per-primitive dispatch (startup benchmark disabled by forced global mode):\n";
@@ -1145,10 +1214,14 @@ int main(int argc,char** argv) {
                  <<", keyint="<<configured_keyint<<", gop-grid="<<(actual.b_fixed_gop_grid?"fixed":"scene-reset")
                  <<", bframes="<<(actual.b_intra_only?0:actual.i_bframes)
                  <<", search="<<actual.i_motion_search_range<<" px (local "<<actual.i_motion_local_search_range<<")"<<", distant-max-mae="<<actual.f_distant_match_max_mae
-                 <<", me="<<me_name<<", long-range="<<long_range_name
+                 <<", me="<<me_name<<", me-algorithm="<<(actual.i_me_algorithm==VC1_ME_ALGORITHM_DIAMOND?"diamond":"umh")<<", long-range="<<long_range_name
+                 <<", subpixel-refinement="<<(actual.b_subpixel_refinement?"on":"off")
+                 <<", subpixel-mode="<<(actual.b_subpixel_refinement?(actual.b_fast_subpixel_refinement?"fast":"full"):"off")
+                 <<", subpixel-range="<<actual.i_subpixel_refinement_range
                  <<", scene-cut="<<(actual.b_scene_cut?"on":"off")<<", scene-threshold="<<actual.f_scene_threshold<<", scene-cut-interval="<<actual.f_scene_cut_min_interval<<"s"
                  <<", fade-comp="<<(actual.b_fade_compensation?"on":"off")
                  <<", variable-transforms="<<(actual.b_variable_transforms?"on":"off")
+                 <<", fast-transform-rdo="<<(actual.b_fast_transform_rdo?"on":"off")
                  <<", trellis="<<actual.i_trellis<<", aq="<<(actual.b_adaptive_quality?std::to_string(actual.f_aq_strength):std::string("off"))
                  <<", dquant="<<(actual.b_dquant?"on":"off")<<", overlap="<<(actual.b_overlap?"on":"off")
                  <<", loop-filter="<<(actual.b_loop_filter?"on":"off")<<", skip-identical="<<(actual.b_skip_identical_frames?"on":"off")
@@ -1238,7 +1311,7 @@ int main(int argc,char** argv) {
                 <<"# input_fps_overridden="<<(input_fps_override_set?1:0)<<"\n"
                 <<"# profile="<<profile_name<<"\n# rc_mode="<<rc_name<<"\n"
                 <<"# bitrate="<<actual.i_bitrate<<"\n# vbv_buffer="<<actual.i_vbv_buffer_size<<"\n"
-                <<"# threads="<<actual.i_threads<<"\n# search_range="<<actual.i_motion_search_range<<"\n# local_search_range="<<actual.i_motion_local_search_range<<"\n"
+                <<"# threads="<<actual.i_threads<<"\n# subpixel_range="<<actual.i_subpixel_refinement_range<<"\n# search_range="<<actual.i_motion_search_range<<"\n# local_search_range="<<actual.i_motion_local_search_range<<"\n# me_algorithm="<<(actual.i_me_algorithm==VC1_ME_ALGORITHM_DIAMOND?"diamond":"umh")<<"\n# subpixel_refinement="<<(actual.b_subpixel_refinement?"on":"off")<<"\n"
                 <<"# bframes="<<(actual.b_intra_only?0:actual.i_bframes)<<"\n# trellis="<<actual.i_trellis<<"\n"<<"# distant_match_max_mae="<<actual.f_distant_match_max_mae<<"\n"
                 <<"# scene_cut_enabled="<<actual.b_scene_cut<<"\n# scene_cut_threshold="<<actual.f_scene_threshold<<"\n# scene_cut_min_interval_seconds="<<actual.f_scene_cut_min_interval<<"\n"
                 <<"# aq_enabled="<<actual.b_adaptive_quality<<"\n# aq_strength="<<actual.f_aq_strength<<"\n# dquant="<<actual.b_dquant<<"\n"

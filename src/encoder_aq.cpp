@@ -137,16 +137,22 @@ Vc1Encoder::PerceptualMbPriority Vc1Encoder::perceptual_mb_priority(const Frame&
     const double green=std::min(cb_neg,cr_neg);
     const double blue=cb_pos*std::clamp((28.0-cr)/80.0,0.35,1.0);
     const double violet=std::min(cb_pos,cr_pos);
+    // Dark reds and browns sit in the +Cr/-Cb quadrant. They are especially
+    // sensitive to coarse chroma/luma quantization because low luminance masks
+    // less of the hue error than the old blue/violet/gray-only low-light law
+    // assumed. Keep the detector broad enough for brick/skin-shadow browns but
+    // require positive Cr so neutral dark gray does not get double credit.
+    const double warm=cr_pos*std::clamp((20.0-cb)/72.0,0.25,1.0);
     const double gray=std::clamp((22.0-sat)/22.0,0.0,1.0);
     const double low=std::clamp((112.0-mean_y)/86.0,0.0,1.0);
     const double medium_high=std::clamp((mean_y-72.0)/86.0,0.0,1.0);
-    const double low_sensitive=low*std::max({blue,violet,0.78*gray});
+    const double low_sensitive=low*std::max({blue,violet,0.92*warm,0.78*gray});
     const double green_sensitive=medium_high*green;
     // The shared MQUANT mostly represents a luma decision. Chroma contributes
     // a deliberately smaller modifier so saturated color cannot dominate the
     // block budget by itself. Neutral gray has no chroma-only bonus.
     out.color_luma=detail*std::max(green_sensitive,low_sensitive);
-    out.color_chroma=detail*std::max(0.65*green_sensitive,low*std::max(blue,violet));
+    out.color_chroma=detail*std::max(0.65*green_sensitive,low*std::max({blue,violet,0.80*warm}));
     // Existing temporal AQ already protects dark/neutral detail and credits-like
     // edges. Keep the new explicit temporal modifier chromatic-only so it does
     // not double-spend those classes and force a coarser picture Q. Intra blocks
@@ -374,9 +380,21 @@ MbQuantDecision Vc1Encoder::choose_dquant_transform_mb(const Frame& src,const Fr
         std::array<int,3> deltas = c_.halfqp
             ? std::array<int,3>{1,1,1}
             : std::array<int,3>{std::max(1,max_delta/2),max_delta,std::max(1,max_delta-1)};
+        // Some valid configurations generate duplicate Q candidates (notably
+        // HALFQP's {1,1,1}).  A rejected candidate previously ran the complete
+        // six-parent transform RDO, including trellis, up to three times.
+        // Deduplicate only the candidate evaluations: preserve the original
+        // candidate order and the strict RD tie/acceptance rule.
+        std::array<int,3> tried_mquant{};
+        int tried_count=0;
         for (int delta:deltas) {
             const int mq=std::min(31,rate_base+delta);
             if (mq<=out.mquant) continue;
+            bool already_tried=false;
+            for (int i=0;i<tried_count;++i)
+                if (tried_mquant[static_cast<size_t>(i)]==mq) { already_tried=true; break; }
+            if (already_tried) continue;
+            tried_mquant[static_cast<size_t>(tried_count++)]=mq;
             const MbTransformDecision cand=choose_transform_mb(src,pred,mx,my,coding_set,use_vlc,mq,true,picture_plan);
             const double crd=rd(cand);
             if (crd < best_rd*0.9995) { out.tx=cand; out.mquant=mq; best_rd=crd; }
@@ -406,13 +424,16 @@ double Vc1Encoder::perceptual_lambda_scale(const std::vector<uint8_t>& src,
             LocalStats st;
             uint64_t sum=0,grad=0,residual=0;
             int grad_n=0;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
             const int vw=std::max(0,std::min(sw,pw-sx));
             const int vh=std::max(0,std::min(sh,ph-sy));
             const SimdTier pst=c_.simd_for(SimdPrimitive::PerceptualStats);
-            if ((pst==SimdTier::X86V1 || pst==SimdTier::Prescott || pst==SimdTier::K10 || pst==SimdTier::Conroe || pst==SimdTier::Penryn || pst==SimdTier::X86V2 || pst==SimdTier::SandyBridge || pst==SimdTier::Bulldozer || pst==SimdTier::Piledriver || pst==SimdTier::Avx2Partial || pst==SimdTier::X86V3 || pst==SimdTier::X86V4) && sx>=0 && sy>=0 && vw>0 && vh>0) {
+            if ((pst==SimdTier::AArch64Neon || pst==SimdTier::X86V1 || pst==SimdTier::Prescott || pst==SimdTier::K10 || pst==SimdTier::Conroe || pst==SimdTier::Penryn || pst==SimdTier::X86V2 || pst==SimdTier::SandyBridge || pst==SimdTier::Bulldozer || pst==SimdTier::Piledriver || pst==SimdTier::Avx2Partial || pst==SimdTier::X86V3 || pst==SimdTier::X86V4) && sx>=0 && sy>=0 && vw>0 && vh>0) {
                 const size_t o=static_cast<size_t>(sy)*pw+sx;
                 bool used=false;
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+                if (pst==SimdTier::AArch64Neon) { simd::perceptual_stats_aarch64_neon(plane.data()+o,pp?pp->data()+o:nullptr,pw,vw,vh,&sum,&grad,&residual,&st.mn,&st.mx,&st.edges,&grad_n); used=true; }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
                 if (pst==SimdTier::X86V4) { simd::perceptual_stats_x86_64_v4(plane.data()+o,pp?pp->data()+o:nullptr,pw,vw,vh,&sum,&grad,&residual,&st.mn,&st.mx,&st.edges,&grad_n); used=true; }
 #endif
@@ -486,6 +507,9 @@ double Vc1Encoder::perceptual_lambda_scale(const std::vector<uint8_t>& src,
         auto cached_luma_mean=[&](const std::vector<uint8_t>& luma) {
             if (aq_luma_mean_ptr_!=luma.data() || aq_luma_mean_size_!=luma.size()) {
                 uint64_t gsum=0;
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+                if (c_.simd_for(SimdPrimitive::SumU8)==SimdTier::AArch64Neon) gsum=simd::sum_u8_aarch64_neon(luma.data(),luma.size()); else
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
                 if (c_.simd_for(SimdPrimitive::SumU8)==SimdTier::X86V4) gsum=simd::sum_u8_x86_64_v4(luma.data(),luma.size()); else
 #endif

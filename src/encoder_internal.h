@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <iomanip>
 #include <sstream>
@@ -74,7 +75,7 @@ enum class QuantizerType { Auto, Uniform, NonUniform };
 enum class StreamSyntax { Advanced, Wmv9Main };
 enum class SimdTier { None=0, Mixed=1, X86V1=2, X86V2=3, X86V3=4, X86V4=5,
                       Prescott=10, Conroe=11, Penryn=12, SandyBridge=13,
-                      K10=14, Bulldozer=15, Piledriver=16, Avx2Partial=17 };
+                      K10=14, Bulldozer=15, Piledriver=16, Avx2Partial=17, AArch64Neon=18, AArch64Dotprod=19, AArch64Rdm=20 };
 // Source compatibility for older internal code while the user-facing name is "none".
 inline constexpr SimdTier kSimdScalar = SimdTier::None;
 
@@ -95,6 +96,9 @@ struct SimdDispatch {
 };
 
 
+bool cpu_has_aarch64_neon();
+bool cpu_has_aarch64_dotprod();
+bool cpu_has_aarch64_rdm();
 bool cpu_has_x86_64_v1();
 bool cpu_has_x86_64_v2();
 bool cpu_has_x86_64_v3();
@@ -110,6 +114,7 @@ bool cpu_has_avx2_partial();
 const char* simd_target_name(SimdTier tier);
 bool simd_target_implemented(SimdTier tier);
 bool simd_target_available(SimdTier tier);
+bool simd_target_supports_primitive(SimdTier tier, SimdPrimitive primitive);
 bool simd_target_auto_eligible(SimdTier tier,bool benchmark_all);
 bool simd_target_fma_capable(SimdTier tier);
 int simd_target_benchmark_slot(SimdTier tier);
@@ -240,13 +245,18 @@ struct EncoderConfig {
     int ac_c_table_index = 0;
     int motion_search_range = 1024;
     int motion_local_search_range = 32;
+    vc1_me_algorithm_e me_algorithm = VC1_ME_ALGORITHM_UMH;
     vc1_me_quality_e me_quality = VC1_ME_SATD;
+    bool subpixel_refinement = true;
+    bool fast_subpixel_refinement = false;
+    int subpixel_refinement_range = 1024;
     vc1_long_range_search_mode_e long_range_search_mode = VC1_LONG_RANGE_COMPARE;
     double distant_match_max_mae = 255.0;
     double scene_threshold = 28.0;
     bool fade_compensation = true;
     double fade_min_gain = 0.04; // minimum luma prediction-MAD improvement to signal intensity compensation
     bool variable_transforms = true;
+    bool fast_transform_rdo = false; // Residual-guided one-candidate transform selection or fixed-8x8 shortcut.
     bool extended_transform_signaling = true; // TTFRM/TTBLK enabled for CQP and modeled ABR/VBV.
     bool dquant = true; // VC-1 frame-selectable macroblock quantizer signaling/RDO (Main/Advanced).
     bool loop_filter = true;
@@ -511,7 +521,8 @@ public:
     // Analyse a P candidate against the immediately preceding reference picture.
     // Group B retains the robust integer search as a seed, then performs decoder-
     // equivalent half/quarter-pixel refinement and progressive Mixed-MV decisions.
-    PAnalysis analyze_p_picture_core(const Frame& f, const Frame& ref, ProgressiveMvMode mode=ProgressiveMvMode::OneMvQpel, bool allow_intra=true, const PAnalysis* shared_seed=nullptr) const;
+    struct BSearchReuse;
+    PAnalysis analyze_p_picture_core(const Frame& f, const Frame& ref, ProgressiveMvMode mode=ProgressiveMvMode::OneMvQpel, bool allow_intra=true, const PAnalysis* shared_seed=nullptr, BSearchReuse* b_reuse=nullptr) const;
 
     static uint8_t intensity_map_y(uint8_t v, const IntensityComp& ic);
 
@@ -558,7 +569,9 @@ public:
                                 const std::vector<MotionVector>& future_anchor_mvs,
                                 const std::vector<uint8_t>& future_anchor_4mv,
                                 const IntensityComp& forward_ic,
-                                int fraction_num, int fraction_den, ProgressiveMvMode mode) const;
+                                int fraction_num, int fraction_den, ProgressiveMvMode mode,
+                                BSearchReuse* forward_reuse=nullptr, BSearchReuse* backward_reuse=nullptr,
+                                const std::shared_ptr<Frame>* cached_weighted_past=nullptr) const;
 
 
     long double sampled_b_mode_rd(const Frame& f,const Frame& past,const Frame& future,const BAnalysis& a,Frame& pred,
@@ -621,7 +634,7 @@ public: // internal helper surface for split implementation units
     };
 
     OverlapPlan choose_i_overlap_plan(const Frame& f) const;
-    SignedFrame reconstruct_i_signed_padded(const Frame& f) const;
+    SignedFrame reconstruct_i_signed_padded(const Frame& f,const OverlapPlan* plan=nullptr) const;
     void apply_i_overlap(SignedFrame& f,const OverlapPlan& plan) const;
     void apply_p_overlap(SignedFrame& f,const std::vector<uint8_t>& intra,int mbw,int mbh) const;
     int intra_recon_bias() const;
@@ -701,6 +714,15 @@ public: // internal helper surface for split implementation units
         std::vector<LongRangeSignatureCell> cells;
     };
 
+    // Per-B-picture, per-reference cache. The global vector and content index
+    // depend on the input/reference pixels and search parameters, NOT on the
+    // candidate qpel-vs-bilinear mode. Each B job owns its caches so GOP worker
+    // concurrency and independently compensated references remain isolated.
+    struct BSearchReuse {
+        std::optional<GlobalMotionResult> global;
+        std::unique_ptr<LongRangeIndex> long_index;
+    };
+
     static uint8_t mean_region(const std::vector<uint8_t>& plane,int pw,int ph,
                                int x0,int y0,int bw,int bh);
 
@@ -733,6 +755,12 @@ public: // internal helper surface for split implementation units
     IntegerMotionResult integer_motion_umh(const Frame& cur,const Frame& ref,int mx,int my,
                                            const PredictorInfo& pi,const GlobalMotionResult& global,
                                            int range) const;
+    IntegerMotionResult integer_motion_diamond(const Frame& cur,const Frame& ref,int mx,int my,
+                                              const PredictorInfo& pi,const GlobalMotionResult& global,
+                                              int range) const;
+    IntegerMotionResult integer_motion_local(const Frame& cur,const Frame& ref,int mx,int my,
+                                            const PredictorInfo& pi,const GlobalMotionResult& global,
+                                            int range) const;
 
     GlobalMotionResult global_motion_search_extended(const Frame& cur,const Frame& ref,int range) const;
 
@@ -744,6 +772,16 @@ public: // internal helper surface for split implementation units
 
     uint64_t block_sad_motion(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
                               MotionVector mv,ProgressiveMvMode mode) const;
+    // Decoder reference pictures contain the entire coded MB raster, not only
+    // the source/display raster. Reject candidates whose *visible* prediction
+    // would read the untracked bottom/right coded padding. Negative coordinates
+    // still use normative edge emulation and are not hidden coded samples.
+    bool motion_uses_hidden_luma(int x0,int y0,int bw,int bh,MotionVector mv,
+                                 ProgressiveMvMode mode) const;
+    bool motion_uses_hidden_chroma(int x0,int y0,int bw,int bh,MotionVector mv,
+                                   bool future) const;
+    bool motion_uses_hidden_padding(int x0,int y0,int bw,int bh,MotionVector mv,
+                                    ProgressiveMvMode mode,bool chroma,bool future=false) const;
     uint64_t block_satd_motion(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
                                MotionVector mv,ProgressiveMvMode mode) const;
     bool vulkan_motion_costs(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
@@ -753,6 +791,9 @@ public: // internal helper surface for split implementation units
                                    int x0,int y0,int bw,int bh,MotionVector mv,
                                    ProgressiveMvMode mode) const;
     uint64_t motion_vector_rate_bits(MotionVector desired,MotionVector pred,ProgressiveMvMode mode,bool more) const;
+    MotionVector refine_motion_integer_only(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
+                                             MotionVector seed,int range,ProgressiveMvMode mode,
+                                             uint64_t* best_sad,uint64_t known_seed_sad) const;
     MotionVector refine_motion_block_staged(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
                                             MotionVector seed,int range,ProgressiveMvMode mode,const PredictorInfo& pi,
                                             bool more,Frame* rd_pred,uint64_t* best_sad=nullptr,

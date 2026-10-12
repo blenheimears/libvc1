@@ -378,12 +378,20 @@ static void field_apply_b_unused(FieldPredState& st,int mbw,int mx,int my,int di
 static Vc1Encoder::MotionVector search_field_mb(const PackedField& src,int mx,int my,int cur,
                                                 const Frame& ref,int ref_field,bool rnd,bool ref_field_picture,
                                                 Vc1Encoder::MotionVector seed,int local_pixels,
-                                                int range_x,int range_y) {
+                                                int range_x,int range_y,bool refine_enabled,int refine_range) {
     const int maxx=std::min(range_x-1,std::max(0,local_pixels)*4);
     const int maxy=std::min(range_y/2-1,std::max(0,local_pixels)*4);
     auto clampmv=[&](Vc1Encoder::MotionVector v){
         v.xq=std::clamp(v.xq,-maxx,maxx);
         v.yq=std::clamp(v.yq,-maxy,maxy);
+        // Integer search can travel past the fractional-refinement cutoff.
+        // Do not carry a fractional predictor into that extended region.
+        if ((!refine_enabled ||
+             std::max(std::abs(v.xq),std::abs(v.yq))>4*refine_range) &&
+            (v.xq%4 || v.yq%4)) {
+            v.xq=(v.xq/4)*4;
+            v.yq=(v.yq/4)*4;
+        }
         return v;
     };
     auto cost=[&](Vc1Encoder::MotionVector v,int stride){
@@ -425,6 +433,11 @@ static Vc1Encoder::MotionVector search_field_mb(const PackedField& src,int mx,in
             }
         }
     }
+    // The independent limit applies to interlaced field ME too: keep the
+    // full integer search but skip fractional evaluation for distant motion.
+    if (!refine_enabled ||
+        std::max(std::abs(best.xq),std::abs(best.yq))>4*refine_range)
+        return clampmv({(best.xq/4)*4,(best.yq/4)*4});
     // Quarter-pel refinement with full 16x16 luma SAD.
     uint64_t full=cost(best,1);
     for (int pass=0;pass<2;++pass) {
@@ -578,10 +591,11 @@ static Vc1Encoder::PerceptualMbPriority field_perceptual_priority(const PackedFi
     long double us=0.0,vs=0.0;for(int y=0;y<cbh;++y)for(int x=0;x<cbw;++x){const size_t o=static_cast<size_t>(cy0+y)*src.cw+cx0+x;us+=src.u[o];vs+=src.v[o];}
     const double cn=static_cast<double>(std::max(1,cbw*cbh)),cb=static_cast<double>(us)/cn-128.0,cr=static_cast<double>(vs)/cn-128.0,sat=std::hypot(cb,cr);
     const double cbp=std::clamp(cb/52.0,0.0,1.0),cbn=std::clamp(-cb/48.0,0.0,1.0),crp=std::clamp(cr/52.0,0.0,1.0),crn=std::clamp(-cr/48.0,0.0,1.0);
-    const double green=std::min(cbn,crn),blue=cbp*std::clamp((28.0-cr)/80.0,0.35,1.0),violet=std::min(cbp,crp),gray=std::clamp((22.0-sat)/22.0,0.0,1.0);
+    const double green=std::min(cbn,crn),blue=cbp*std::clamp((28.0-cr)/80.0,0.35,1.0),violet=std::min(cbp,crp);
+    const double warm=crp*std::clamp((20.0-cb)/72.0,0.25,1.0),gray=std::clamp((22.0-sat)/22.0,0.0,1.0);
     const double low=std::clamp((112.0-myv)/86.0,0.0,1.0),mh=std::clamp((myv-72.0)/86.0,0.0,1.0);
-    const double lows=low*std::max({blue,violet,0.78*gray}),greens=mh*green;
-    out.color_luma=detail*std::max(greens,lows);out.color_chroma=detail*std::max(0.65*greens,low*std::max(blue,violet));
+    const double lows=low*std::max({blue,violet,0.92*warm,0.78*gray}),greens=mh*green;
+    out.color_luma=detail*std::max(greens,lows);out.color_chroma=detail*std::max(0.65*greens,low*std::max({blue,violet,0.80*warm}));
     const double raw=intra?(4.8*out.dark_detail+1.55*out.color_luma+0.45*out.color_chroma):(out.color_chroma>0.03?(0.75*out.color_luma+0.25*out.color_chroma):0.0);
     out.requested_q_boost=std::clamp(aq_strength*raw,0.0,intra?6.0:2.0);return out;
 }
@@ -696,7 +710,8 @@ Vc1Encoder::PEncodeResult Vc1Encoder::encode_p_interlaced_fields(const Frame& f,
             MotionVector best_mv{};
             for (const auto& r:refs) {
                 const auto mv=search_field_mb(src,mx,my,cur,*r.source,r.ref_field_type,c_.rndctrl,
-                                              r.source_field_picture,seed,local,range_x,range_y);
+                                              r.source_field_picture,seed,local,range_x,range_y,
+                                              c_.subpixel_refinement,c_.subpixel_refinement_range);
                 const auto cost=field_mb_sad(src,mx,my,cur,*r.source,r.ref_field_type,mv,c_.rndctrl,
                                              r.source_field_picture,1);
                 if (cost<best_cost || (cost==best_cost && (!r.opposite && best_ref.opposite)) ||
@@ -866,7 +881,8 @@ Vc1Encoder::BEncodeResult Vc1Encoder::encode_b_interlaced_fields(const Frame& f,
             MotionVector best_mv{};
             for (const auto& r:refs) {
                 const auto mv=search_field_mb(src,mx,my,cur,*r.source,r.ref_field_type,c_.rndctrl,
-                                              r.source_field_picture,seed,local,range_x,range_y);
+                                              r.source_field_picture,seed,local,range_x,range_y,
+                                              c_.subpixel_refinement,c_.subpixel_refinement_range);
                 const auto cost=field_mb_sad(src,mx,my,cur,*r.source,r.ref_field_type,mv,c_.rndctrl,
                                              r.source_field_picture,1);
                 const int ref_penalty=(r.direction?1:0)+(r.opposite?1:0);

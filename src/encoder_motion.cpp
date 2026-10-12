@@ -44,7 +44,7 @@ bool Vc1Encoder::mv_mode_bilinear(ProgressiveMvMode m) { return m==ProgressiveMv
 
 bool Vc1Encoder::mv_mode_mixed(ProgressiveMvMode m) { return m==ProgressiveMvMode::MixedMv; }
 
-PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, ProgressiveMvMode mode, bool allow_intra, const PAnalysis* shared_seed) const {
+PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, ProgressiveMvMode mode, bool allow_intra, const PAnalysis* shared_seed, BSearchReuse* b_reuse) const {
         if (f.width != c_.width || f.height != c_.height ||
             ref.width != c_.width || ref.height != c_.height)
             throw std::runtime_error("P-picture reference dimensions do not match encoder configuration");
@@ -69,7 +69,7 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
         // ran global search plus predictor/coarse/fine/refinement bookkeeping,
         // repeatedly measuring the exact same zero-motion candidate.  This is
         // both the natural behavior of --search-range 0 and the foundation of
-        // the --fastest preset.
+        // the explicit zero-search configuration.
         if (c_.motion_search_range==0) {
             for (int my=0;my<mbh;++my) for (int mx=0;mx<mbw;++mx) {
                 const uint64_t zero_sad=mb_sad(f,ref,mx,my,0,0,1);
@@ -86,7 +86,14 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
         }
         const int configured_range=c_.motion_search_range;
         const int local_range=std::min(configured_range,std::max(0,c_.motion_local_search_range));
-        const GlobalMotionResult global=shared_seed ? GlobalMotionResult{} : global_motion_search(f,ref,local_range);
+        GlobalMotionResult global{};
+        if (!shared_seed) {
+            if (b_reuse && b_reuse->global) global=*b_reuse->global;
+            else {
+                global=global_motion_search(f,ref,local_range);
+                if (b_reuse) b_reuse->global=global;
+            }
+        }
         if (shared_seed && shared_seed->mvs.size()!=mbs)
             throw std::runtime_error("shared P motion seed has the wrong macroblock count");
         if (shared_seed) {
@@ -98,7 +105,8 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
         // content index is built lazily only after a block actually fails the
         // local/neighbor short-circuit.
         std::vector<uint8_t> long_range_propagated(mbs,0);
-        std::unique_ptr<LongRangeIndex> long_range_index;
+        std::unique_ptr<LongRangeIndex> owned_long_range_index;
+        const LongRangeIndex* long_range_index=b_reuse ? b_reuse->long_index.get() : nullptr;
         std::unique_ptr<Frame> me_rd_pred;
         if (c_.me_quality==VC1_ME_RD) me_rd_pred=std::make_unique<Frame>(empty_frame());
 
@@ -146,7 +154,7 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                             }
                         }
                         if (!have_short_circuit)
-                            im=integer_motion_umh(f,ref,mx,my,pi,global,local_range);
+                            im=integer_motion_local(f,ref,mx,my,pi,global,local_range);
                     } else {
                         // Normal policy always measures local UMH first. In the
                         // default compare mode, a propagated distant candidate
@@ -154,7 +162,7 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                         // and the lower full-SAD candidate wins. local-good
                         // deliberately skips all distant work after a strong
                         // local result.
-                        im=integer_motion_umh(f,ref,mx,my,pi,global,local_range);
+                        im=integer_motion_local(f,ref,mx,my,pi,global,local_range);
                         const uint64_t local_sad=im.full_sad;
                         const uint64_t pixels=active_mb_pixels(mx,my);
                         if (pixels) out.distant_local_mae[pos]=static_cast<double>(local_sad)/static_cast<double>(pixels);
@@ -185,8 +193,16 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                     // propagated-distant evaluation; neither makes every block
                     // pay for the frame-wide signature index.
                     if (range>local_range && !motion_match_good(im.full_sad,mx,my)) {
-                        if (!long_range_index)
-                            long_range_index=std::make_unique<LongRangeIndex>(build_long_range_index(ref));
+                        if (!long_range_index) {
+                            auto index=std::make_unique<LongRangeIndex>(build_long_range_index(ref));
+                            if (b_reuse) {
+                                b_reuse->long_index=std::move(index);
+                                long_range_index=b_reuse->long_index.get();
+                            } else {
+                                owned_long_range_index=std::move(index);
+                                long_range_index=owned_long_range_index.get();
+                            }
+                        }
                         uint64_t ext_candidate_sad=std::numeric_limits<uint64_t>::max();
                         int ext_decision=VC1_DISTANT_MATCH_NONE;
                         const auto ext=extended_content_motion(f,ref,mx,my,range,*long_range_index,im,
@@ -212,6 +228,13 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                                                    MotionVector{im.dx*4,im.dy*4},range,one_mode,rate_pi,true,
                                                    me_rd_pred.get(),&one_sad,known_one_seed_sad);
                 }
+                // A global/propagated seed or Vulkan's precomputed costs can
+                // bypass the CPU candidate gate. Never publish an MV which
+                // makes a visible pixel read the black coded MB extension.
+                if (motion_uses_hidden_padding(x0,y0,16,16,one,one_mode,true)) {
+                    one=MotionVector{};
+                    one_sad=block_sad_motion(f,ref,x0,y0,16,16,one,one_mode);
+                }
                 const uint64_t one_screen_sad=one_sad;
                 out.mvs[pos]=one;
                 out.block_mvs[pos].fill(one);
@@ -232,7 +255,15 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                         const auto pi4=predictor_info_4mv(out.block_mvs,out.use_intra,mbw,mbh,mx,my,k);
                         MotionVector pred=pi4.pre;
                         const int bx=x0+(k&1)*8, by=y0+((k>>1)&1)*8;
-                        MotionVector best_seed=one;
+                        const auto within_subpixel_radius=[&](MotionVector mv) {
+                            const int limit=4*c_.subpixel_refinement_range;
+                            if (std::max(std::abs(mv.xq),std::abs(mv.yq))>limit) {
+                                mv.xq=(mv.xq/4)*4;
+                                mv.yq=(mv.yq/4)*4;
+                            }
+                            return mv;
+                        };
+                        MotionVector best_seed=within_subpixel_radius(one);
                         uint64_t seed_cost=block_sad_qpel(f,ref,bx,by,8,8,best_seed);
                         const std::array<MotionVector,10> seeds={{
                             one,pred,
@@ -244,6 +275,7 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                         const auto qb=motion_search_bounds_qpel(range);
                         for (auto seed:seeds) {
                             seed.xq=std::clamp(seed.xq,qb.xmin,qb.xmax); seed.yq=std::clamp(seed.yq,qb.ymin,qb.ymax);
+                            seed=within_subpixel_radius(seed);
                             if (same_mv(seed,best_seed)) continue; // already measured.
                             const uint64_t c=block_sad_qpel(f,ref,bx,by,8,8,seed);
                             const int cm=std::abs(seed.xq)+std::abs(seed.yq),bm=std::abs(best_seed.xq)+std::abs(best_seed.yq);
@@ -273,8 +305,12 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                             extra_mv_bits+=groupa::kMvDiffBits[0][static_cast<size_t>(sym)]+mv_suffix_bits(est);
                         }
                     }
+                    // Four individually safe luma vectors may have a median
+                    // chroma vector that references hidden coded pixels.
+                    const bool four_chroma_safe=!motion_uses_hidden_chroma(
+                        x0,y0,16,16,chroma_mv_4mv(four),false);
                     bool choose4=false;
-                    if (c_.me_quality==VC1_ME_RD && me_rd_pred) {
+                    if (four_chroma_safe && c_.me_quality==VC1_ME_RD && me_rd_pred) {
                         // Mixed-MV's four subblock vectors are shortlisted with
                         // SATD+rate individually.  Make the final 1-MV-vs-4-MV
                         // choice with the same codec-aware whole-MB transform
@@ -323,7 +359,7 @@ PAnalysis Vc1Encoder::analyze_p_picture_core(const Frame& f, const Frame& ref, P
                             base_lambda*static_cast<long double>(four_lscale)*
                             static_cast<long double>(four_tx.estimated_bits+four_bits);
                         choose4=four_rd<one_rd;
-                    } else {
+                    } else if (four_chroma_safe) {
                         choose4=four_sad + static_cast<uint64_t>(std::llround(lambda*extra_mv_bits)) + 8 <
                                 static_cast<uint64_t>(std::llround(static_cast<double>(one_sad)*0.985));
                     }
@@ -680,9 +716,9 @@ bool Vc1Encoder::has_good_motion_match(const Frame& f,const Frame& ref) const {
                     if (motion_match_good(pr.full_sad,mx,my)) { im=pr; done=true; selected_distant=true; }
                 }
                 if (!done)
-                    im=integer_motion_umh(f,*prediction_ref,mx,my,pi,global,local_range);
+                    im=integer_motion_local(f,*prediction_ref,mx,my,pi,global,local_range);
             } else {
-                im=integer_motion_umh(f,*prediction_ref,mx,my,pi,global,local_range);
+                im=integer_motion_local(f,*prediction_ref,mx,my,pi,global,local_range);
                 const bool skip_distant=
                     c_.long_range_search_mode==VC1_LONG_RANGE_LOCAL_GOOD_SKIP &&
                     motion_match_good(im.full_sad,mx,my);
@@ -718,7 +754,9 @@ BAnalysis Vc1Encoder::analyze_b_picture_mode(const Frame& f, const Frame& past, 
                                 const std::vector<MotionVector>& future_anchor_mvs,
                                 const std::vector<uint8_t>& future_anchor_4mv,
                                 const IntensityComp& forward_ic,
-                                int fraction_num, int fraction_den, ProgressiveMvMode mode) const {
+                                int fraction_num, int fraction_den, ProgressiveMvMode mode,
+                                BSearchReuse* forward_reuse, BSearchReuse* backward_reuse,
+                                const std::shared_ptr<Frame>* cached_weighted_past) const {
         const int mbw=(c_.width+15)/16, mbh=(c_.height+15)/16;
         const size_t mbs=static_cast<size_t>(mbw)*mbh;
         if (future_anchor_mvs.size()!=mbs || future_anchor_4mv.size()!=mbs)
@@ -727,7 +765,7 @@ BAnalysis Vc1Encoder::analyze_b_picture_mode(const Frame& f, const Frame& past, 
               (fraction_den==3 && (fraction_num==1 || fraction_num==2))))
             throw std::runtime_error("unsupported B-picture temporal fraction");
 
-        // The deliberately minimal configuration used by --fastest does not
+        // The deliberately minimal zero-search configuration does not
         // spend CPU choosing among B prediction modes.  Preserve B pictures and
         // legal syntax, but make every macroblock forward-predicted with zero
         // forward/backward vector state.  Residual coding still corrects the
@@ -749,14 +787,18 @@ BAnalysis Vc1Encoder::analyze_b_picture_mode(const Frame& f, const Frame& past, 
         std::shared_ptr<Frame> weighted_past;
         const Frame* past_prediction=&past;
         if (forward_ic.enabled) {
-            weighted_past=std::make_shared<Frame>(intensity_compensated_reference(past,forward_ic));
+            // Exactly the same compensated pixels are used by both candidate
+            // picture-wide motion modes. Construct them once, not twice.
+            weighted_past=cached_weighted_past && *cached_weighted_past
+                ? *cached_weighted_past
+                : std::make_shared<Frame>(intensity_compensated_reference(past,forward_ic));
             past_prediction=weighted_past.get();
         }
         // B pictures cannot signal intensity compensation themselves. The forward
         // reference inherits the LUT signaled by the future P anchor; backward
         // prediction from that future anchor is unweighted.
-        const PAnalysis fwd=analyze_p_picture_core(f,*past_prediction,mode,false,nullptr);
-        const PAnalysis bwd=analyze_p_picture_core(f,future,mode,false,nullptr);
+        const PAnalysis fwd=analyze_p_picture_core(f,*past_prediction,mode,false,nullptr,forward_reuse);
+        const PAnalysis bwd=analyze_p_picture_core(f,future,mode,false,nullptr,backward_reuse);
         BAnalysis out;
         out.mv_mode=mode;
         out.forward_intensity=forward_ic;
@@ -803,25 +845,47 @@ BAnalysis Vc1Encoder::analyze_b_picture_mode(const Frame& f, const Frame& past, 
                 const MotionVector db=scale_direct(future_anchor_mvs[pos],true,mx,my);
                 const MotionVector fm=fwd.mvs[pos], bm=bwd.mvs[pos];
 
-                // Compute the four B-mode distortion candidates in one raster
-                // pass.  The old code sampled fm once for Forward and again for
-                // Interpolated, and bm once for Backward and again for
-                // Interpolated.  Reusing those identical decoder-equivalent
-                // samples reduces six luma interpolation calls/pixel to four.
+                // Materialize each distinct prediction block once. This uses
+                // the same decoder-equivalent interpolation as final motion
+                // compensation, including its existing SIMD path. The old
+                // per-pixel loop called scalar luma_mc_sample_mode four times
+                // for EVERY pixel, bypassing that vectorized block primitive.
+                // Identical direct/searched vectors share their blocks too.
                 const int x0=mx*16,y0=my*16;
+                const int vw=std::min(16,c_.width-x0),vh=std::min(16,c_.height-y0);
+                const bool safe_fm=!motion_uses_hidden_padding(x0,y0,16,16,fm,mode,true,false);
+                const bool safe_bm=!motion_uses_hidden_padding(x0,y0,16,16,bm,mode,true,true);
+                const bool safe_df=!motion_uses_hidden_padding(x0,y0,16,16,df,mode,true,false);
+                const bool safe_db=!motion_uses_hidden_padding(x0,y0,16,16,db,mode,true,true);
+                std::array<uint8_t,16*16> pf_block{},pb_block{},df_block{},db_block{};
+                predict_luma_motion_block(pf_block.data(),16,*past_prediction,x0,y0,vw,vh,fm,mode);
+                predict_luma_motion_block(pb_block.data(),16,future,x0,y0,vw,vh,bm,mode);
+                const bool same_forward=same_mv(fm,df),same_backward=same_mv(bm,db);
+                if (!same_forward)
+                    predict_luma_motion_block(df_block.data(),16,*past_prediction,x0,y0,vw,vh,df,mode);
+                if (!same_backward)
+                    predict_luma_motion_block(db_block.data(),16,future,x0,y0,vw,vh,db,mode);
+                const uint8_t* pdf_block=same_forward?pf_block.data():df_block.data();
+                const uint8_t* pdb_block=same_backward?pb_block.data():db_block.data();
                 uint64_t cf=0,cb_only=0,ci=0,cd=0;
-                for (int y=0;y<16 && y0+y<c_.height;++y) for (int x=0;x<16 && x0+x<c_.width;++x) {
-                    const int px=x0+x,py=y0+y;
-                    const int src=f.y[static_cast<size_t>(py)*c_.width+px];
-                    const int pf=luma_mc_sample_mode(past_prediction->y,c_.width,c_.height,px,py,fm.xq,fm.yq,mode,c_.rndctrl);
-                    const int pb=luma_mc_sample_mode(future.y,c_.width,c_.height,px,py,bm.xq,bm.yq,mode,c_.rndctrl);
-                    const int pdf=luma_mc_sample_mode(past_prediction->y,c_.width,c_.height,px,py,df.xq,df.yq,mode,c_.rndctrl);
-                    const int pdb=luma_mc_sample_mode(future.y,c_.width,c_.height,px,py,db.xq,db.yq,mode,c_.rndctrl);
+                for (int y=0;y<vh;++y) for (int x=0;x<vw;++x) {
+                    const size_t off=static_cast<size_t>(y)*16+x;
+                    const int src=f.y[static_cast<size_t>(y0+y)*c_.width+x0+x];
+                    const int pf=pf_block[off],pb=pb_block[off];
+                    const int pdf=pdf_block[off],pdb=pdb_block[off];
                     cf+=static_cast<uint64_t>(std::abs(src-pf));
                     cb_only+=static_cast<uint64_t>(std::abs(src-pb));
                     ci+=static_cast<uint64_t>(std::abs(src-((pf+pb+1)>>1)));
                     cd+=static_cast<uint64_t>(std::abs(src-((pdf+pdb+1)>>1)));
                 }
+                // Direct vectors are derived from the future P anchor rather
+                // than searched. Screen each *used* reference, including the
+                // distinct B-future chroma rounding, before comparing modes.
+                constexpr uint64_t invalid=uint64_t{1}<<54;
+                if (!safe_fm) cf=invalid;
+                if (!safe_bm) cb_only=invalid;
+                if (!safe_fm || !safe_bm) ci=invalid;
+                if (!safe_df || !safe_db) cd=invalid;
 
                 // Group B mode RDO: compare prediction error with an estimate
                 // of the MVDATA + BMVTYPE syntax consumed by each candidate.
@@ -1001,8 +1065,13 @@ BAnalysis Vc1Encoder::analyze_b_picture(const Frame& f, const Frame& past, const
                                 const IntensityComp& forward_ic,
                                 int fraction_num, int fraction_den) const {
         SpeedProfileScope speed_scope(c_.speed_profiler,SpeedProfileOp::BAnalysis);
+        // Local to this B-picture task: never shared between frames/GOP workers.
+        // Separate reference caches are required because forward may use an
+        // intensity-compensated image while backward always uses future raw.
+        BSearchReuse forward_reuse,backward_reuse;
         BAnalysis q=analyze_b_picture_mode(f,past,future,future_anchor_mvs,future_anchor_4mv,
-                                           forward_ic,fraction_num,fraction_den,ProgressiveMvMode::OneMvQpel);
+                                           forward_ic,fraction_num,fraction_den,ProgressiveMvMode::OneMvQpel,
+                                           &forward_reuse,&backward_reuse);
         // 0.1.72: ABR/VBV and CQP share this qpel-vs-halfpel B-picture RDO.
         // Main-profile B half-pel predictor state has profile-specific pullback
         // and modulo behavior that is not yet independently decoder-equivalent
@@ -1011,11 +1080,12 @@ BAnalysis Vc1Encoder::analyze_b_picture(const Frame& f, const Frame& past, const
         // residual-aware comparison below. P-picture half-pel modes remain
         // available in both profiles.
         if (c_.syntax==StreamSyntax::Wmv9Main) return q;
-        // --fastest zero-motion case is intentionally one pass.
+        // The explicit zero-motion configuration intentionally uses one pass.
         if (c_.motion_search_range==0 && !c_.fade_compensation && !c_.loop_filter &&
             !c_.variable_transforms && c_.trellis==0 && !c_.adaptive_quality) return q;
         BAnalysis h=analyze_b_picture_mode(f,past,future,future_anchor_mvs,future_anchor_4mv,
-                                           forward_ic,fraction_num,fraction_den,ProgressiveMvMode::OneMvHpelBilinear);
+                                           forward_ic,fraction_num,fraction_den,ProgressiveMvMode::OneMvHpelBilinear,
+                                           &forward_reuse,&backward_reuse,&q.compensated_past);
         EncoderConfig neutral_cfg=c_;
         neutral_cfg.adaptive_quality=false;
         neutral_cfg.aq_strength=0.0;
@@ -1427,6 +1497,11 @@ MotionVector Vc1Encoder::predictor_b_main(const std::vector<MotionVector>& mv,in
     }
 
 uint64_t Vc1Encoder::frame_sad(const Frame& cur,const Frame& ref,int dx,int dy,int stride) const {
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::FrameSad)==SimdTier::AArch64Neon)
+            return simd::frame_sad_aarch64_neon(cur.y.data(),cur.width,ref.y.data(),ref.width,
+                                                cur.width,cur.height,dx,dy,stride);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (c_.simd_for(SimdPrimitive::FrameSad)==SimdTier::X86V4)
             return simd::frame_sad_x86_64_v4(cur.y.data(),cur.width,ref.y.data(),ref.width,
@@ -2065,9 +2140,66 @@ GlobalMotionResult Vc1Encoder::global_motion_search(const Frame& cur,const Frame
         return {best.dx,best.dy,frame_sad(cur,ref,best.dx,best.dy,1)};
     }
 
+bool Vc1Encoder::motion_uses_hidden_luma(int x0,int y0,int bw,int bh,MotionVector mv,
+                                         ProgressiveMvMode mode) const {
+    const int vw=c_.visible_width(),vh=c_.visible_height();
+    // The displayed raster can be narrower than the even internal YUV420
+    // raster (e.g. an odd DISPLAY_EXT dimension) as well as the coded MB
+    // raster.  Only the last case exposes distinct decoder-side padding.
+    const bool right_padding=vw<((c_.width+15)/16)*16;
+    const bool bottom_padding=vh<((c_.height+15)/16)*16;
+    if (!right_padding && !bottom_padding) return false;
+    const int aw=std::max(0,std::min(bw,vw-x0));
+    const int ah=std::max(0,std::min(bh,vh-y0));
+    if (!aw || !ah) return false;
+    const int ix=floor_div4(mv.xq),iy=floor_div4(mv.yq);
+    const int fx=mv.xq-ix*4,fy=mv.yq-iy*4;
+    const int right=fx?(mv_mode_bilinear(mode)?1:2):0;
+    const int bottom=fy?(mv_mode_bilinear(mode)?1:2):0;
+    // Only the right/bottom extension can be real coded pixels missing from a
+    // cropped reference. At the left/top the decoder and encoder both extend
+    // their first actual pixel. An aligned edge likewise has no coded padding.
+    return (right_padding && x0+aw-1+ix+right>=vw) ||
+           (bottom_padding && y0+ah-1+iy+bottom>=vh);
+}
+
+bool Vc1Encoder::motion_uses_hidden_chroma(int x0,int y0,int bw,int bh,MotionVector mv,
+                                           bool future) const {
+    const int cw=c_.visible_chroma_width(),ch=c_.visible_chroma_height();
+    const bool right_padding=cw<((c_.width+15)/16)*8;
+    const bool bottom_padding=ch<((c_.height+15)/16)*8;
+    if (!right_padding && !bottom_padding) return false;
+    const int cx=x0/2,cy=y0/2;
+    const int aw=std::max(0,std::min(bw/2,cw-cx));
+    const int ah=std::max(0,std::min(bh/2,ch-cy));
+    if (!aw || !ah) return false;
+    // Keep the B future-reference FASTUVMC asymmetry identical to
+    // chroma_mc_sample() and the decoder.
+    int uvx=arshift(mv.xq+((mv.xq&3)==3),1);
+    int uvy=arshift(mv.yq+((mv.yq&3)==3),1);
+    auto round_even=[future](int v) {
+        if (future) return v<0 ? v-(v&1) : v+(v&1);
+        return v<0 ? v+(v&1) : v-(v&1);
+    };
+    uvx=round_even(uvx); uvy=round_even(uvy);
+    const int ix=floor_div4(uvx),iy=floor_div4(uvy);
+    const bool fx=(uvx-ix*4)!=0,fy=(uvy-iy*4)!=0;
+    return (right_padding && cx+aw-1+ix+(fx?1:0)>=cw) ||
+           (bottom_padding && cy+ah-1+iy+(fy?1:0)>=ch);
+}
+
+bool Vc1Encoder::motion_uses_hidden_padding(int x0,int y0,int bw,int bh,MotionVector mv,
+                                             ProgressiveMvMode mode,bool chroma,bool future) const {
+    return motion_uses_hidden_luma(x0,y0,bw,bh,mv,mode) ||
+           (chroma && motion_uses_hidden_chroma(x0,y0,bw,bh,mv,future));
+}
+
 uint64_t Vc1Encoder::mb_sad(const Frame& cur,const Frame& ref,int mx,int my,int dx,int dy,int stride) const {
         uint64_t sad=0;
         const int x0=mx*16,y0=my*16;
+        if (motion_uses_hidden_padding(x0,y0,16,16,MotionVector{dx*4,dy*4},
+                                       ProgressiveMvMode::OneMvQpel,true))
+            return std::numeric_limits<uint64_t>::max()/4;
         if (c_.syntax == StreamSyntax::Wmv9Main) {
             // WMV3/Main reconstructs complete coded macroblocks beyond the visible
             // dimensions.  This encoder deliberately exposes/stores cropped
@@ -2080,11 +2212,15 @@ uint64_t Vc1Encoder::mb_sad(const Frame& cur,const Frame& ref,int mx,int my,int 
                 x0+vw-1+dx >= ref.width || y0+vh-1+dy >= ref.height)
                 return std::numeric_limits<uint64_t>::max()/4;
         }
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (x0+16<=cur.width && y0+16<=cur.height &&
             x0+dx>=0 && y0+dy>=0 && x0+dx+16<=ref.width && y0+dy+16<=ref.height) {
             const uint8_t* a=cur.y.data()+static_cast<size_t>(y0)*cur.width+x0;
             const uint8_t* b=ref.y.data()+static_cast<size_t>(y0+dy)*ref.width+x0+dx;
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+            if (c_.simd_for(SimdPrimitive::BlockSad)==SimdTier::AArch64Neon)
+                return simd::block_sad_aarch64_neon(a,cur.width,b,ref.width,16,16,stride);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
             if (c_.simd_for(SimdPrimitive::BlockSad)==SimdTier::X86V4)
                 return simd::block_sad_x86_64_v4(a,cur.width,b,ref.width,16,16,stride);
@@ -2149,6 +2285,8 @@ uint64_t Vc1Encoder::mb_sad(const Frame& cur,const Frame& ref,int mx,int my,int 
 
 uint64_t Vc1Encoder::block_sad_qpel(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,MotionVector mv) const {
         const uint64_t bad=std::numeric_limits<uint64_t>::max()/4;
+        if (motion_uses_hidden_padding(x0,y0,bw,bh,mv,ProgressiveMvMode::OneMvQpel,
+                                       bw==16 && bh==16 && !(x0&15) && !(y0&15))) return bad;
         const int ix=floor_div4(mv.xq), iy=floor_div4(mv.yq);
         const int hm=mv.xq-ix*4, vm=mv.yq-iy*4;
         const int sx0=x0+ix, sy0=y0+iy;
@@ -2166,6 +2304,36 @@ uint64_t Vc1Encoder::block_sad_qpel(const Frame& cur,const Frame& ref,int x0,int
             const int right=sx0+bw-1+tap_right, bottom=sy0+bh-1+tap_bottom;
             if (left<0 || top<0 || right>=ref.width || bottom>=ref.height) return bad;
         }
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+        if (c_.simd_for(SimdPrimitive::LumaQpelSad)==SimdTier::AArch64Dotprod && aw>0 && ah>0 && (aw%8)==0) {
+            const uint8_t* cp=cur.y.data()+static_cast<size_t>(y0)*cur.width+x0;
+            if (interior) {
+                const uint8_t* rp=ref.y.data()+static_cast<size_t>(sy0)*ref.width+sx0;
+                return simd::block_sad_luma_qpel_aarch64_dotprod(cp,cur.width,rp,ref.width,aw,ah,hm,vm,c_.rndctrl);
+            }
+            // Right-edge motion candidates may be wider than 16 pixels. Allocate
+            // the clamped 1/2-pixel halo for the actual active dimensions.
+            const int ps=aw+3;
+            std::vector<uint8_t> patch(static_cast<size_t>(ps)*(ah+3));
+            for (int py=-1;py<ah+2;++py) for (int px=-1;px<aw+2;++px)
+                patch[static_cast<size_t>(py+1)*ps+px+1]=sample_clamped(ref.y,ref.width,ref.height,sx0+px,sy0+py);
+            return simd::block_sad_luma_qpel_aarch64_dotprod(cp,cur.width,patch.data()+ps+1,ps,aw,ah,hm,vm,c_.rndctrl);
+        }
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::LumaQpelSad)==SimdTier::AArch64Neon && aw>0 && ah>0 && (aw%8)==0) {
+            const uint8_t* cp=cur.y.data()+static_cast<size_t>(y0)*cur.width+x0;
+            if (interior) {
+                const uint8_t* rp=ref.y.data()+static_cast<size_t>(sy0)*ref.width+sx0;
+                return simd::block_sad_luma_qpel_aarch64_neon(cp,cur.width,rp,ref.width,aw,ah,hm,vm,c_.rndctrl);
+            }
+            alignas(64) std::array<uint8_t,24*24> patch{};
+            constexpr int ps=24;
+            for (int py=-1;py<ah+2;++py) for (int px=-1;px<aw+2;++px)
+                patch[static_cast<size_t>(py+1)*ps+px+1]=sample_clamped(ref.y,ref.width,ref.height,sx0+px,sy0+py);
+            return simd::block_sad_luma_qpel_aarch64_neon(cp,cur.width,patch.data()+ps+1,ps,aw,ah,hm,vm,c_.rndctrl);
+        }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (c_.simd_for(SimdPrimitive::LumaQpelSad)==SimdTier::X86V4 && aw>0 && ah>0 && (aw%8)==0) {
             const uint8_t* cp=cur.y.data()+static_cast<size_t>(y0)*cur.width+x0;
@@ -2503,6 +2671,8 @@ uint64_t Vc1Encoder::block_sad_motion(const Frame& cur,const Frame& ref,int x0,i
                               MotionVector mv,ProgressiveMvMode mode) const {
         if (!mv_mode_bilinear(mode)) return block_sad_qpel(cur,ref,x0,y0,bw,bh,mv);
         const uint64_t bad=std::numeric_limits<uint64_t>::max()/4;
+        if (motion_uses_hidden_padding(x0,y0,bw,bh,mv,mode,
+                                       bw==16 && bh==16 && !(x0&15) && !(y0&15))) return bad;
         if ((mv.xq&1)||(mv.yq&1)) return bad;
         const int ix=floor_div4(mv.xq),iy=floor_div4(mv.yq);
         const int fx=mv.xq-ix*4,fy=mv.yq-iy*4;
@@ -2513,9 +2683,23 @@ uint64_t Vc1Encoder::block_sad_motion(const Frame& cur,const Frame& ref,int x0,i
         }
         const int aw=std::max(0,std::min(bw,cur.width-x0));
         const int ah=std::max(0,std::min(bh,cur.height-y0));
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         const int sx0=x0+ix,sy0=y0+iy;
         const bool interior=sx0>=0 && sy0>=0 && sx0+aw-1+(fx?1:0)<ref.width && sy0+ah-1+(fy?1:0)<ref.height;
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::LumaBilinearSad)==SimdTier::AArch64Neon && aw>0 && ah>0 && (aw%8)==0) {
+            const uint8_t* cp=cur.y.data()+static_cast<size_t>(y0)*cur.width+x0;
+            if (interior) {
+                const uint8_t* rp=ref.y.data()+static_cast<size_t>(sy0)*ref.width+sx0;
+                return simd::block_sad_luma_bilinear_aarch64_neon(cp,cur.width,rp,ref.width,aw,ah,fx!=0,fy!=0,c_.rndctrl);
+            }
+            alignas(64) std::array<uint8_t,24*24> patch{};
+            constexpr int ps=24;
+            for (int py=0;py<ah+(fy?1:0);++py) for (int px=0;px<aw+(fx?1:0);++px)
+                patch[static_cast<size_t>(py)*ps+px]=sample_clamped(ref.y,ref.width,ref.height,sx0+px,sy0+py);
+            return simd::block_sad_luma_bilinear_aarch64_neon(cp,cur.width,patch.data(),ps,aw,ah,fx!=0,fy!=0,c_.rndctrl);
+        }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (c_.simd_for(SimdPrimitive::LumaBilinearSad)==SimdTier::X86V4 && aw>0 && ah>0 && (aw%8)==0) {
             const uint8_t* cp=cur.y.data()+static_cast<size_t>(y0)*cur.width+x0;
@@ -2793,6 +2977,9 @@ uint64_t Vc1Encoder::block_satd_motion(const Frame& cur,const Frame& ref,int x0,
         auto satd_full=[&](const uint8_t* cp,const uint8_t* pp)->uint64_t {
             switch(satd_tier) {
               case SimdTier::None: return satd4x4_scalar(cp,cur.width,pp,16);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+              case SimdTier::AArch64Neon: return simd::satd4x4_aarch64_neon(cp,cur.width,pp,16);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
               case SimdTier::X86V1: return simd::satd4x4_x86_64_v1(cp,cur.width,pp,16);
 #endif
@@ -3057,10 +3244,42 @@ long double Vc1Encoder::motion_mb_rd_cost(const Frame& cur,const Frame& ref,int 
                lambda*static_cast<long double>(tx.estimated_bits+mv_bits);
     }
 
+MotionVector Vc1Encoder::refine_motion_integer_only(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
+                                                       MotionVector seed,int range,ProgressiveMvMode mode,
+                                                       uint64_t* best_sad,uint64_t known_seed_sad) const {
+    // Unlike skipping the stencil after it executes, this bypasses ALL
+    // fractional candidate interpolation and SATD/RD work.
+    const auto qb=motion_search_bounds_qpel(range);
+    const auto snap=[&](int q,int lo,int hi) {
+        q=std::clamp(q,lo,hi);
+        const int nearest=q>=0?(q+1)/4:(q-1)/4;
+        return std::clamp(nearest*4,lo,hi/4*4);
+    };
+    MotionVector integer{snap(seed.xq,qb.xmin,qb.xmax),
+                         snap(seed.yq,qb.ymin,qb.ymax)};
+    if (motion_uses_hidden_padding(x0,y0,bw,bh,integer,mode,
+                                   bw==16 && bh==16 && !(x0&15) && !(y0&15)))
+        integer=MotionVector{};
+    if (best_sad)
+        *best_sad=(integer.xq==seed.xq && integer.yq==seed.yq &&
+                   known_seed_sad!=std::numeric_limits<uint64_t>::max())
+            ? known_seed_sad
+            : block_sad_motion(cur,ref,x0,y0,bw,bh,integer,mode);
+    return integer;
+}
+
 MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
                                                      MotionVector seed,int range,ProgressiveMvMode mode,
                                                      const PredictorInfo& pi,bool more,Frame* rd_pred,
                                                      uint64_t* best_sad,uint64_t known_seed_sad) const {
+        // Integer ME always runs across the configured local AND extended range.
+        // Only fractional candidate evaluation is limited by this independent
+        // per-axis displacement cutoff (quarter-pixel MV units).
+        const int limit_q=4*c_.subpixel_refinement_range;
+        if (!c_.subpixel_refinement || limit_q==0 ||
+            std::max(std::abs(seed.xq),std::abs(seed.yq))>limit_q)
+            return refine_motion_integer_only(cur,ref,x0,y0,bw,bh,seed,range,mode,
+                                              best_sad,known_seed_sad);
         SpeedProfileScope speed_scope(c_.speed_profiler,SpeedProfileOp::MotionSubpel);
         if (c_.me_quality==VC1_ME_SAD)
             return refine_motion_block(cur,ref,x0,y0,bw,bh,seed,range,mode,best_sad,known_seed_sad);
@@ -3073,16 +3292,23 @@ MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame
             long double score=0.0L;
             bool satd_eligible=true;
         };
-        std::vector<Candidate> all;
-        all.reserve(20);
+        // This function is called once per candidate/block, often millions of
+        // times per GOP.  Reuse scratch allocations on the calling worker: a
+        // refinement never recursively enters this routine, and thread-local
+        // storage keeps independently encoded GOPs race-free.
+        static thread_local std::vector<Candidate> all;
+        all.clear();
+        if (all.capacity()<20) all.reserve(20);
         const auto qb=motion_search_bounds_qpel(range);
+        const int xmin=std::max(qb.xmin,-limit_q),xmax=std::min(qb.xmax,limit_q);
+        const int ymin=std::max(qb.ymin,-limit_q),ymax=std::min(qb.ymax,limit_q);
         auto make_even=[](int v) { if (!(v&1)) return v; return v>0?v-1:v+1; };
         if (mv_mode_halfpel(mode)) {
-            seed.xq=make_even(std::clamp(seed.xq,qb.xmin,qb.xmax));
-            seed.yq=make_even(std::clamp(seed.yq,qb.ymin,qb.ymax));
+            seed.xq=make_even(std::clamp(seed.xq,xmin,xmax));
+            seed.yq=make_even(std::clamp(seed.yq,ymin,ymax));
         } else {
-            seed.xq=std::clamp(seed.xq,qb.xmin,qb.xmax);
-            seed.yq=std::clamp(seed.yq,qb.ymin,qb.ymax);
+            seed.xq=std::clamp(seed.xq,xmin,xmax);
+            seed.yq=std::clamp(seed.yq,ymin,ymax);
         }
         auto tie_less=[](MotionVector a,MotionVector b) {
             const int am=std::abs(a.xq)+std::abs(a.yq),bm=std::abs(b.xq)+std::abs(b.yq);
@@ -3097,14 +3323,28 @@ MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame
         auto add=[&](MotionVector mv,uint64_t known=std::numeric_limits<uint64_t>::max()) -> Candidate& {
             if (auto* c=find_candidate(mv)) return *c;
             Candidate c{}; c.mv=mv;
-            c.sad=known!=std::numeric_limits<uint64_t>::max()
-                ? known : block_sad_motion(cur,ref,x0,y0,bw,bh,mv,mode);
+            // A known SAD may have come from the global predictor or Vulkan,
+            // neither of which has the cropped-reference legality constraint.
+            // Never let such a score enter SATD/RD candidate selection.
+            const bool chroma=bw==16 && bh==16 && !(x0&15) && !(y0&15);
+            c.sad=motion_uses_hidden_padding(x0,y0,bw,bh,mv,mode,chroma)
+                ? std::numeric_limits<uint64_t>::max()/4
+                : (known!=std::numeric_limits<uint64_t>::max()
+                    ? known : block_sad_motion(cur,ref,x0,y0,bw,bh,mv,mode));
             all.push_back(c);
             return all.back();
         };
         add(seed,known_seed_sad);
+        // A legal zero vector is guaranteed on a cropped edge.  It must be in
+        // the shortlist even if the global seed and its entire stencil lie in
+        // hidden padding; merely correcting the chosen vector afterwards can
+        // unnecessarily discard a good legal candidate.
+        if (motion_uses_hidden_padding(x0,y0,bw,bh,seed,mode,
+                                       bw==16 && bh==16 && !(x0&15) && !(y0&15)))
+            add(MotionVector{});
         auto add_batch=[&](const std::vector<MotionVector>& batch) {
-            std::vector<uint64_t> gpu_costs;
+            static thread_local std::vector<uint64_t> gpu_costs;
+            gpu_costs.clear();
             if (vulkan_motion_costs(cur,ref,x0,y0,bw,bh,batch,1,mode,false,gpu_costs) &&
                 gpu_costs.size()==batch.size()) {
                 for (size_t i=0;i<batch.size();++i) add(batch[i],gpu_costs[i]);
@@ -3119,26 +3359,87 @@ MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame
         // exact CPU ordering/tie law.
         MotionVector half_best=seed;
         uint64_t half_sad=all.front().sad;
-        std::vector<MotionVector> half_batch;
-        half_batch.reserve(9);
-        for (int oy=-2;oy<=2;oy+=2) for (int ox=-2;ox<=2;ox+=2) {
-            MotionVector mv{std::clamp(seed.xq+ox,qb.xmin,qb.xmax),std::clamp(seed.yq+oy,qb.ymin,qb.ymax)};
-            if (mv_mode_halfpel(mode)) { mv.xq=make_even(mv.xq); mv.yq=make_even(mv.yq); }
-            half_batch.push_back(mv);
-        }
-        add_batch(half_batch);
-        for (const auto mv:half_batch) {
-            if (auto* c=find_candidate(mv); c && (c->sad<half_sad || (c->sad==half_sad && tie_less(c->mv,half_best)))) {
-                half_sad=c->sad; half_best=c->mv;
+        static thread_local std::vector<MotionVector> half_batch;
+        half_batch.clear();
+        if (half_batch.capacity()<9) half_batch.reserve(9);
+        // The accelerated mode never discards fractional precision. Probe the
+        // center and cardinal neighbors first, then probe the two diagonals
+        // adjacent to the winning direction. No speculative SATD work is done
+        // until all legal SAD candidates in the chosen stencil are collected.
+        // The full mode retains its exact 0.2.64 rectangular 3x3 stencil.
+        const bool fast=c_.fast_subpixel_refinement;
+        if (fast) {
+            half_batch.push_back(seed);
+            for (const auto& [ox,oy]:std::array<std::pair<int,int>,4>{{{-2,0},{2,0},{0,-2},{0,2}}}) {
+                MotionVector mv{std::clamp(seed.xq+ox,xmin,xmax),
+                                std::clamp(seed.yq+oy,ymin,ymax)};
+                if (mv_mode_halfpel(mode)) {mv.xq=make_even(mv.xq);mv.yq=make_even(mv.yq);}
+                half_batch.push_back(mv);
+            }
+        } else {
+            for (int oy=-2;oy<=2;oy+=2) for (int ox=-2;ox<=2;ox+=2) {
+                MotionVector mv{std::clamp(seed.xq+ox,xmin,xmax),std::clamp(seed.yq+oy,ymin,ymax)};
+                if (mv_mode_halfpel(mode)) { mv.xq=make_even(mv.xq); mv.yq=make_even(mv.yq); }
+                half_batch.push_back(mv);
             }
         }
+        add_batch(half_batch);
+        auto update_half=[&](const std::vector<MotionVector>& batch) {
+            for (const auto mv:batch) {
+                if (auto* c=find_candidate(mv); c && (c->sad<half_sad || (c->sad==half_sad && tie_less(c->mv,half_best)))) {
+                    half_sad=c->sad; half_best=c->mv;
+                }
+            }
+        };
+        update_half(half_batch);
+        if (fast && !same_mv(half_best,seed)) {
+            // The center-to-winner axis determines the two promising corners;
+            // this captures diagonal motion without always scoring four corners.
+            static thread_local std::vector<MotionVector> diagonals;
+            diagonals.clear();
+            if (diagonals.capacity()<2) diagonals.reserve(2);
+            const int dx=half_best.xq-seed.xq,dy=half_best.yq-seed.yq;
+            if (dx && !dy) {
+                for (int oy:{-2,2}) diagonals.push_back({half_best.xq,
+                    std::clamp(seed.yq+oy,ymin,ymax)});
+            } else if (dy && !dx) {
+                for (int ox:{-2,2}) diagonals.push_back({std::clamp(seed.xq+ox,xmin,xmax),half_best.yq});
+            }
+            if (mv_mode_halfpel(mode))
+                for (auto& mv:diagonals) {mv.xq=make_even(mv.xq);mv.yq=make_even(mv.yq);}
+            add_batch(diagonals);
+            update_half(diagonals);
+        }
         if (!mv_mode_halfpel(mode)) {
-            std::vector<MotionVector> quarter_batch;
-            quarter_batch.reserve(9);
-            for (int oy=-1;oy<=1;++oy) for (int ox=-1;ox<=1;++ox)
-                quarter_batch.push_back({std::clamp(half_best.xq+ox,qb.xmin,qb.xmax),
-                                         std::clamp(half_best.yq+oy,qb.ymin,qb.ymax)});
-            add_batch(quarter_batch);
+            static thread_local std::vector<MotionVector> quarter_batch;
+            quarter_batch.clear();
+            if (quarter_batch.capacity()<9) quarter_batch.reserve(9);
+            if (fast) {
+                const MotionVector qc=half_best;
+                quarter_batch.push_back(qc);
+                for (const auto& [ox,oy]:std::array<std::pair<int,int>,4>{{{-1,0},{1,0},{0,-1},{0,1}}})
+                    quarter_batch.push_back({std::clamp(qc.xq+ox,xmin,xmax),
+                                             std::clamp(qc.yq+oy,ymin,ymax)});
+                add_batch(quarter_batch);
+                MotionVector qbmv=qc;
+                uint64_t qcost=find_candidate(qc)->sad;
+                for (const auto mv:quarter_batch) {
+                    const auto* c=find_candidate(mv);
+                    if (c && (c->sad<qcost || (c->sad==qcost && tie_less(c->mv,qbmv)))) {
+                        qbmv=c->mv;qcost=c->sad;
+                    }
+                }
+                quarter_batch.clear();
+                const int dx=qbmv.xq-qc.xq,dy=qbmv.yq-qc.yq;
+                if (dx && !dy) for (int oy:{-1,1}) quarter_batch.push_back({qbmv.xq,std::clamp(qc.yq+oy,ymin,ymax)});
+                else if (dy && !dx) for (int ox:{-1,1}) quarter_batch.push_back({std::clamp(qc.xq+ox,xmin,xmax),qbmv.yq});
+                add_batch(quarter_batch);
+            } else {
+                for (int oy=-1;oy<=1;++oy) for (int ox=-1;ox<=1;++ox)
+                    quarter_batch.push_back({std::clamp(half_best.xq+ox,xmin,xmax),
+                                             std::clamp(half_best.yq+oy,ymin,ymax)});
+                add_batch(quarter_batch);
+            }
         }
 
         std::sort(all.begin(),all.end(),[&](const Candidate& a,const Candidate& b) {
@@ -3151,7 +3452,8 @@ MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame
         // this value and must not be biased merely because RD deliberately
         // trades a few SAD units for fewer bits or a more compressible residual.
         const uint64_t screen_sad=all.front().sad;
-        if (all.size()>8) all.resize(8);
+        if (all.size()>(c_.fast_subpixel_refinement?4u:8u))
+            all.resize(c_.fast_subpixel_refinement?4u:8u);
 
         const long double lambda_me=std::max(1.0,0.35*static_cast<double>(c_.pqindex));
         auto rate_for=[&](Candidate& cand) {
@@ -3196,16 +3498,28 @@ MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame
         const uint64_t sad_guard_slack=std::max<uint64_t>(4,pct3);
         const uint64_t sad_guard_limit=rate_winner.sad > std::numeric_limits<uint64_t>::max()-sad_guard_slack
             ? std::numeric_limits<uint64_t>::max() : rate_winner.sad+sad_guard_slack;
-        std::vector<MotionVector> satd_batch;
-        satd_batch.reserve(all.size());
-        for (const auto& cand:all) satd_batch.push_back(cand.mv);
-        std::vector<uint64_t> satd_costs;
+        static thread_local std::vector<MotionVector> satd_batch;
+        satd_batch.clear();
+        if (satd_batch.capacity()<8) satd_batch.reserve(8);
+        // The SAD envelope is a hard eligibility gate below.  Ineligible
+        // candidates cannot win or enter the RD finalist shortlist, so their
+        // SATD was wasted work (on both CPU and optional Vulkan).
+        for (auto& cand:all) {
+            cand.satd_eligible=cand.sad<std::numeric_limits<uint64_t>::max()/8 &&
+                               cand.sad<=sad_guard_limit;
+            if (cand.satd_eligible) satd_batch.push_back(cand.mv);
+        }
+        static thread_local std::vector<uint64_t> satd_costs;
+        satd_costs.clear();
         const bool gpu_satd=vulkan_motion_costs(cur,ref,x0,y0,bw,bh,satd_batch,1,mode,true,satd_costs) &&
-                            satd_costs.size()==all.size();
+                            satd_costs.size()==satd_batch.size();
+        size_t eligible_index=0;
         for (size_t i=0;i<all.size();++i) {
             auto& cand=all[i];
-            cand.satd=gpu_satd?satd_costs[i]:block_satd_motion(cur,ref,x0,y0,bw,bh,cand.mv,mode);
-            cand.satd_eligible=cand.sad<=sad_guard_limit;
+            cand.satd=cand.satd_eligible
+                ? (gpu_satd?satd_costs[eligible_index]:block_satd_motion(cur,ref,x0,y0,bw,bh,cand.mv,mode))
+                : std::numeric_limits<uint64_t>::max()/4;
+            if (cand.satd_eligible) ++eligible_index;
             cand.score=static_cast<long double>(cand.satd)+lambda_me*static_cast<long double>(cand.rate);
         }
         std::sort(all.begin(),all.end(),[&](const Candidate& a,const Candidate& b) {
@@ -3237,8 +3551,9 @@ MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame
         // texture it can rank a visually poorer displacement very highly.  The
         // union prevents that proxy from starving the real codec-aware stage of
         // the strongest temporal/rate candidate.
-        std::vector<Candidate> finalists;
-        finalists.reserve(6);
+        static thread_local std::vector<Candidate> finalists;
+        finalists.clear();
+        if (finalists.capacity()<6) finalists.reserve(6);
         auto add_finalist=[&](const Candidate& c) {
             for (const auto& f:finalists) if (same_mv(f.mv,c.mv)) return;
             finalists.push_back(c);
@@ -3281,8 +3596,19 @@ MotionVector Vc1Encoder::refine_motion_block_staged(const Frame& cur,const Frame
 MotionVector Vc1Encoder::refine_qpel_block(const Frame& cur,const Frame& ref,int x0,int y0,int bw,int bh,
                                    MotionVector seed,int range,uint64_t* best_sad,
                                    uint64_t known_seed_sad) const {
+        const int limit_q=4*c_.subpixel_refinement_range;
+        if (!c_.subpixel_refinement || limit_q==0 || std::max(std::abs(seed.xq),std::abs(seed.yq))>limit_q)
+            return refine_motion_integer_only(cur,ref,x0,y0,bw,bh,seed,range,
+                                              ProgressiveMvMode::OneMvQpel,best_sad,known_seed_sad);
         const auto qb=motion_search_bounds_qpel(range);
-        seed.xq=std::clamp(seed.xq,qb.xmin,qb.xmax); seed.yq=std::clamp(seed.yq,qb.ymin,qb.ymax);
+        const int xmin=std::max(qb.xmin,-limit_q),xmax=std::min(qb.xmax,limit_q);
+        const int ymin=std::max(qb.ymin,-limit_q),ymax=std::min(qb.ymax,limit_q);
+        seed.xq=std::clamp(seed.xq,xmin,xmax); seed.yq=std::clamp(seed.yq,ymin,ymax);
+        if (motion_uses_hidden_padding(x0,y0,bw,bh,seed,ProgressiveMvMode::OneMvQpel,
+                                       bw==16 && bh==16 && !(x0&15) && !(y0&15))) {
+            seed=MotionVector{};
+            known_seed_sad=std::numeric_limits<uint64_t>::max();
+        }
         auto better=[](uint64_t sad,MotionVector mv,uint64_t best,MotionVector bmv) {
             const int mag=std::abs(mv.xq)+std::abs(mv.yq), bmag=std::abs(bmv.xq)+std::abs(bmv.yq);
             if (sad!=best) return sad<best;
@@ -3300,21 +3626,59 @@ MotionVector Vc1Encoder::refine_qpel_block(const Frame& cur,const Frame& ref,int
             if (seen_count<seen.size()) seen[seen_count++]=mv;
             return false;
         };
-        // The center sample is already known.  Older code evaluated it once in
-        // the seed setup, again in the half-pixel grid, and again in the qpel
-        // grid.  Skip those exact duplicates without changing candidate order.
-        for (int oy=-2;oy<=2;oy+=2) for (int ox=-2;ox<=2;ox+=2) {
-            MotionVector mv{std::clamp(seed.xq+ox,qb.xmin,qb.xmax),std::clamp(seed.yq+oy,qb.ymin,qb.ymax)};
-            if (seen_before(mv)) continue;
-            const uint64_t c=block_sad_qpel(cur,ref,x0,y0,bw,bh,mv);
-            if (better(c,mv,cost,best)) { cost=c; best=mv; }
-        }
-        const MotionVector half=best;
-        for (int oy=-1;oy<=1;++oy) for (int ox=-1;ox<=1;++ox) {
-            MotionVector mv{std::clamp(half.xq+ox,qb.xmin,qb.xmax),std::clamp(half.yq+oy,qb.ymin,qb.ymax)};
-            if (seen_before(mv)) continue;
-            const uint64_t c=block_sad_qpel(cur,ref,x0,y0,bw,bh,mv);
-            if (better(c,mv,cost,best)) { cost=c; best=mv; }
+        // SAD fast mode must not enter the SATD finalist machinery. Probe
+        // center/cardinals, then only corners adjacent to the winning axis.
+        // A fixed on-stack visited set prevents duplicate interpolation calls;
+        // the full mode below retains its previous candidate order verbatim.
+        if (c_.fast_subpixel_refinement) {
+            const auto evaluate=[&](MotionVector mv) {
+                mv.xq=std::clamp(mv.xq,xmin,xmax);
+                mv.yq=std::clamp(mv.yq,ymin,ymax);
+                if (seen_before(mv)) return;
+                const uint64_t sad=block_sad_qpel(cur,ref,x0,y0,bw,bh,mv);
+                if (better(sad,mv,cost,best)) {cost=sad;best=mv;}
+            };
+            if (cost==0 && best.xq==0 && best.yq==0) {
+                if (best_sad) *best_sad=0;
+                return best;
+            }
+            constexpr std::array<std::pair<int,int>,4> cardinal{{{-2,0},{2,0},{0,-2},{0,2}}};
+            for (const auto& [dx,dy]:cardinal) evaluate({seed.xq+dx,seed.yq+dy});
+            const MotionVector axis=best;
+            const int dx=axis.xq-seed.xq,dy=axis.yq-seed.yq;
+            if (dx && !dy) {
+                evaluate({axis.xq,axis.yq-2});
+                evaluate({axis.xq,axis.yq+2});
+            } else if (dy && !dx) {
+                evaluate({axis.xq-2,axis.yq});
+                evaluate({axis.xq+2,axis.yq});
+            }
+            const MotionVector half=best;
+            constexpr std::array<std::pair<int,int>,4> quarter{{{-1,0},{1,0},{0,-1},{0,1}}};
+            for (const auto& [qx,qy]:quarter) evaluate({half.xq+qx,half.yq+qy});
+            const MotionVector qaxis=best;
+            const int qdx=qaxis.xq-half.xq,qdy=qaxis.yq-half.yq;
+            if (qdx && !qdy) {
+                evaluate({qaxis.xq,qaxis.yq-1});
+                evaluate({qaxis.xq,qaxis.yq+1});
+            } else if (qdy && !qdx) {
+                evaluate({qaxis.xq-1,qaxis.yq});
+                evaluate({qaxis.xq+1,qaxis.yq});
+            }
+        } else {
+            for (int oy=-2;oy<=2;oy+=2) for (int ox=-2;ox<=2;ox+=2) {
+                MotionVector mv{std::clamp(seed.xq+ox,xmin,xmax),std::clamp(seed.yq+oy,ymin,ymax)};
+                if (seen_before(mv)) continue;
+                const uint64_t c=block_sad_qpel(cur,ref,x0,y0,bw,bh,mv);
+                if (better(c,mv,cost,best)) { cost=c; best=mv; }
+            }
+            const MotionVector half=best;
+            for (int oy=-1;oy<=1;++oy) for (int ox=-1;ox<=1;++ox) {
+                MotionVector mv{std::clamp(half.xq+ox,xmin,xmax),std::clamp(half.yq+oy,ymin,ymax)};
+                if (seen_before(mv)) continue;
+                const uint64_t c=block_sad_qpel(cur,ref,x0,y0,bw,bh,mv);
+                if (better(c,mv,cost,best)) { cost=c; best=mv; }
+            }
         }
         if (best_sad) *best_sad=cost;
         return best;
@@ -3324,10 +3688,21 @@ MotionVector Vc1Encoder::refine_motion_block(const Frame& cur,const Frame& ref,i
                                      MotionVector seed,int range,ProgressiveMvMode mode,uint64_t* best_sad,
                                      uint64_t known_seed_sad) const {
         if (!mv_mode_halfpel(mode)) return refine_qpel_block(cur,ref,x0,y0,bw,bh,seed,range,best_sad,known_seed_sad);
+        const int limit_q=4*c_.subpixel_refinement_range;
+        if (!c_.subpixel_refinement || limit_q==0 || std::max(std::abs(seed.xq),std::abs(seed.yq))>limit_q)
+            return refine_motion_integer_only(cur,ref,x0,y0,bw,bh,seed,range,mode,
+                                              best_sad,known_seed_sad);
         const auto qb=motion_search_bounds_qpel(range);
+        const int xmin=std::max(qb.xmin,-limit_q),xmax=std::min(qb.xmax,limit_q);
+        const int ymin=std::max(qb.ymin,-limit_q),ymax=std::min(qb.ymax,limit_q);
         auto make_even=[](int v) { if (!(v&1)) return v; return v>0?v-1:v+1; };
-        seed.xq=make_even(std::clamp(seed.xq,qb.xmin,qb.xmax));
-        seed.yq=make_even(std::clamp(seed.yq,qb.ymin,qb.ymax));
+        seed.xq=make_even(std::clamp(seed.xq,xmin,xmax));
+        seed.yq=make_even(std::clamp(seed.yq,ymin,ymax));
+        if (motion_uses_hidden_padding(x0,y0,bw,bh,seed,mode,
+                                       bw==16 && bh==16 && !(x0&15) && !(y0&15))) {
+            seed=MotionVector{};
+            known_seed_sad=std::numeric_limits<uint64_t>::max();
+        }
         auto better=[](uint64_t sad,MotionVector mv,uint64_t best,MotionVector bmv) {
             if (sad!=best) return sad<best;
             const int m=std::abs(mv.xq)+std::abs(mv.yq),bm=std::abs(bmv.xq)+std::abs(bmv.yq);
@@ -3344,11 +3719,30 @@ MotionVector Vc1Encoder::refine_motion_block(const Frame& cur,const Frame& ref,i
             if (seen_count<seen.size()) seen[seen_count++]=mv;
             return false;
         };
-        for (int oy=-2;oy<=2;oy+=2) for (int ox=-2;ox<=2;ox+=2) {
-            MotionVector mv{make_even(std::clamp(seed.xq+ox,qb.xmin,qb.xmax)),make_even(std::clamp(seed.yq+oy,qb.ymin,qb.ymax))};
-            if (seen_before(mv)) continue;
+        if (c_.fast_subpixel_refinement && cost==0 && best.xq==0 && best.yq==0) {
+            if (best_sad) *best_sad=0;
+            return best;
+        }
+        const auto evaluate=[&](MotionVector mv) {
+            mv.xq=make_even(std::clamp(mv.xq,xmin,xmax));
+            mv.yq=make_even(std::clamp(mv.yq,ymin,ymax));
+            if (seen_before(mv)) return;
             const uint64_t c=block_sad_motion(cur,ref,x0,y0,bw,bh,mv,mode);
-            if (better(c,mv,cost,best)) { cost=c; best=mv; }
+            if (better(c,mv,cost,best)) {cost=c;best=mv;}
+        };
+        if (c_.fast_subpixel_refinement) {
+            constexpr std::array<std::pair<int,int>,4> cardinal{{{-2,0},{2,0},{0,-2},{0,2}}};
+            for (const auto& [dx,dy]:cardinal) evaluate({seed.xq+dx,seed.yq+dy});
+            const MotionVector axis=best;
+            const int dx=axis.xq-seed.xq,dy=axis.yq-seed.yq;
+            if (dx && !dy) {
+                evaluate({axis.xq,axis.yq-2}); evaluate({axis.xq,axis.yq+2});
+            } else if (dy && !dx) {
+                evaluate({axis.xq-2,axis.yq}); evaluate({axis.xq+2,axis.yq});
+            }
+        } else {
+            for (int oy=-2;oy<=2;oy+=2) for (int ox=-2;ox<=2;ox+=2)
+                evaluate({seed.xq+ox,seed.yq+oy});
         }
         if (best_sad) *best_sad=cost;
         return best;

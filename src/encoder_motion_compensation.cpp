@@ -35,7 +35,7 @@ using AcLookup = Vc1Encoder::AcLookup;
 using DcCodePlan = Vc1Encoder::DcCodePlan;
 
 namespace {
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
 static inline int floor_div4_v3(int v) {
     return v>=0 ? v/4 : -((-v+3)/4);
 }
@@ -55,6 +55,12 @@ static bool try_luma_mc_simd(SimdTier tier,uint8_t* dst,int dst_stride,
     const int top=bilinear?0:(vm?1:0),bottom=vm?(bilinear?1:2):0;
     if (sx0-left<0 || sy0-top<0 || sx0+bw-1+right>=rw || sy0+bh-1+bottom>=rh) return false;
     const uint8_t* rp=ref.data()+static_cast<size_t>(sy0)*rw+sx0;
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+    if (tier==SimdTier::AArch64Dotprod) { if (average) simd::luma_mc_block_avg_aarch64_dotprod(dst,dst_stride,rp,rw,bw,bh,hm,vm,rnd,bilinear); else simd::luma_mc_block_aarch64_dotprod(dst,dst_stride,rp,rw,bw,bh,hm,vm,rnd,bilinear); return true; }
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+    if (tier==SimdTier::AArch64Neon) { if (average) simd::luma_mc_block_avg_aarch64_neon(dst,dst_stride,rp,rw,bw,bh,hm,vm,rnd,bilinear); else simd::luma_mc_block_aarch64_neon(dst,dst_stride,rp,rw,bw,bh,hm,vm,rnd,bilinear); return true; }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
     if (tier==SimdTier::X86V4) { if (average) simd::luma_mc_block_avg_x86_64_v4(dst,dst_stride,rp,rw,bw,bh,hm,vm,rnd,bilinear); else simd::luma_mc_block_x86_64_v4(dst,dst_stride,rp,rw,bw,bh,hm,vm,rnd,bilinear); return true; }
 #endif
@@ -119,6 +125,12 @@ static bool try_chroma_mc_simd(SimdTier tier,uint8_t* dst,int dst_stride,
     const int sx0=x0+q.ix,sy0=y0+q.iy;
     if (sx0<0 || sy0<0 || sx0+bw-1+(q.fx?1:0)>=rw || sy0+bh-1+(q.fy?1:0)>=rh) return false;
     const uint8_t* rp=ref.data()+static_cast<size_t>(sy0)*rw+sx0;
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+    if (tier==SimdTier::AArch64Dotprod) { if (average) simd::chroma_mc_block_avg_aarch64_dotprod(dst,dst_stride,rp,rw,bw,bh,q.fx,q.fy,rnd); else simd::chroma_mc_block_aarch64_dotprod(dst,dst_stride,rp,rw,bw,bh,q.fx,q.fy,rnd); return true; }
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+    if (tier==SimdTier::AArch64Neon) { if (average) simd::chroma_mc_block_avg_aarch64_neon(dst,dst_stride,rp,rw,bw,bh,q.fx,q.fy,rnd); else simd::chroma_mc_block_aarch64_neon(dst,dst_stride,rp,rw,bw,bh,q.fx,q.fy,rnd); return true; }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
     if (tier==SimdTier::X86V4) { if (average) simd::chroma_mc_block_avg_x86_64_v4(dst,dst_stride,rp,rw,bw,bh,q.fx,q.fy,rnd); else simd::chroma_mc_block_x86_64_v4(dst,dst_stride,rp,rw,bw,bh,q.fx,q.fy,rnd); return true; }
 #endif
@@ -192,6 +204,12 @@ Frame Vc1Encoder::intensity_compensated_reference(const Frame& ref, const Intens
         if (ic.lumscale==0) { scale=-64; shift=(255-static_cast<int>(ic.lumshift)*2)*64; if (ic.lumshift>31) shift += 128*64; }
         else { scale=static_cast<int>(ic.lumscale)+32; shift=(ic.lumshift>31 ? static_cast<int>(ic.lumshift)-64 : static_cast<int>(ic.lumshift))*64; }
         const SimdTier yt=c_.simd_for(SimdPrimitive::IntensityLuma), ct=c_.simd_for(SimdPrimitive::IntensityChroma);
+#if defined(LIBVC1_HAVE_AARCH64_RDM)
+        if (yt==SimdTier::AArch64Rdm) simd::intensity_map_plane_aarch64_rdm(out.y.data(),ref.y.data(),out.y.size(),scale,shift); else
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (yt==SimdTier::AArch64Neon) simd::intensity_map_plane_aarch64_neon(out.y.data(),ref.y.data(),out.y.size(),scale,shift); else
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (yt==SimdTier::X86V4) simd::intensity_map_plane_x86_64_v4(out.y.data(),ref.y.data(),out.y.size(),scale,shift); else
 #endif
@@ -229,6 +247,12 @@ Frame Vc1Encoder::intensity_compensated_reference(const Frame& ref, const Intens
         if (yt==SimdTier::X86V3) simd::intensity_map_plane_x86_64_v3(out.y.data(),ref.y.data(),out.y.size(),scale,shift); else
 #endif
         for (size_t i=0;i<out.y.size();++i) out.y[i]=intensity_map_y(ref.y[i],ic);
+#if defined(LIBVC1_HAVE_AARCH64_RDM)
+        if (ct==SimdTier::AArch64Rdm) { simd::intensity_map_chroma_plane_aarch64_rdm(out.u.data(),ref.u.data(),out.u.size(),scale); simd::intensity_map_chroma_plane_aarch64_rdm(out.v.data(),ref.v.data(),out.v.size(),scale); } else
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (ct==SimdTier::AArch64Neon) { simd::intensity_map_chroma_plane_aarch64_neon(out.u.data(),ref.u.data(),out.u.size(),scale); simd::intensity_map_chroma_plane_aarch64_neon(out.v.data(),ref.v.data(),out.v.size(),scale); } else
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (ct==SimdTier::X86V4) { simd::intensity_map_chroma_plane_x86_64_v4(out.u.data(),ref.u.data(),out.u.size(),scale); simd::intensity_map_chroma_plane_x86_64_v4(out.v.data(),ref.v.data(),out.v.size(),scale); } else
 #endif
@@ -433,7 +457,7 @@ void Vc1Encoder::predict_luma_motion_block(uint8_t* dst,int dst_stride,const Fra
             return;
         }
         bool done=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None)
             done=try_luma_mc_simd(c_.simd_for(SimdPrimitive::LumaMc),dst,dst_stride,
                                   ref.y,ref.width,ref.height,x0,y0,bw,bh,mv.xq,mv.yq,
@@ -469,7 +493,7 @@ void Vc1Encoder::motion_compensate_mb(Frame& dst,const Frame& ref,int mx,int my,
         const int vw=std::max(0,std::min(16,c_.width-x0));
         const int vh=std::max(0,std::min(16,c_.height-y0));
         bool ydone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None)
             ydone=try_luma_mc_simd(c_.simd_for(SimdPrimitive::LumaMc),dst.y.data()+static_cast<size_t>(y0)*c_.width+x0,c_.width,
                                  ref.y,c_.width,c_.height,x0,y0,vw,vh,mv.xq,mv.yq,c_.rndctrl,
@@ -482,7 +506,7 @@ void Vc1Encoder::motion_compensate_mb(Frame& dst,const Frame& ref,int mx,int my,
         const int cw=c_.width/2,ch=c_.height/2,cx0=mx*8,cy0=my*8;
         const int cvw=std::max(0,std::min(8,cw-cx0)),cvh=std::max(0,std::min(8,ch-cy0));
         bool udone=false,vdone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             udone=try_chroma_mc_simd(c_.simd_for(SimdPrimitive::ChromaMc),dst.u.data()+static_cast<size_t>(cy0)*cw+cx0,cw,ref.u,cw,ch,cx0,cy0,cvw,cvh,mv.xq,mv.yq,false,c_.rndctrl,false);
             vdone=try_chroma_mc_simd(c_.simd_for(SimdPrimitive::ChromaMc),dst.v.data()+static_cast<size_t>(cy0)*cw+cx0,cw,ref.v,cw,ch,cx0,cy0,cvw,cvh,mv.xq,mv.yq,false,c_.rndctrl,false);
@@ -517,7 +541,7 @@ void Vc1Encoder::motion_compensate_4mv(Frame& dst,const Frame& ref,int mx,int my
             const int bx=x0+(k&1)*8,by=y0+((k>>1)&1)*8;
             const int bw=std::max(0,std::min(8,c_.width-bx)),bh=std::max(0,std::min(8,c_.height-by));
             bool done=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
             if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None)
                 done=try_luma_mc_simd(c_.simd_for(SimdPrimitive::LumaMc),dst.y.data()+static_cast<size_t>(by)*c_.width+bx,c_.width,ref.y,c_.width,c_.height,
                                      bx,by,bw,bh,mv[static_cast<size_t>(k)].xq,mv[static_cast<size_t>(k)].yq,c_.rndctrl,false,false);
@@ -533,7 +557,7 @@ void Vc1Encoder::motion_compensate_4mv(Frame& dst,const Frame& ref,int mx,int my
         const int cw=c_.width/2,ch=c_.height/2,cx0=mx*8,cy0=my*8;
         const int bw=std::max(0,std::min(8,cw-cx0)),bh=std::max(0,std::min(8,ch-cy0));
         bool udone=false,vdone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             udone=try_chroma_mc_simd(c_.simd_for(SimdPrimitive::ChromaMc),dst.u.data()+static_cast<size_t>(cy0)*cw+cx0,cw,ref.u,cw,ch,cx0,cy0,bw,bh,cmv.xq,cmv.yq,false,c_.rndctrl,false);
             vdone=try_chroma_mc_simd(c_.simd_for(SimdPrimitive::ChromaMc),dst.v.data()+static_cast<size_t>(cy0)*cw+cx0,cw,ref.v,cw,ch,cx0,cy0,bw,bh,cmv.xq,cmv.yq,false,c_.rndctrl,false);
@@ -553,7 +577,7 @@ void Vc1Encoder::motion_compensate_4mv_padded(Frame& dst,const Frame& ref,int mx
         for (int k=0;k<4;++k) {
             const int bx=x0+(k&1)*8,by=y0+((k>>1)&1)*8;
             bool done=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
             if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None)
                 done=try_luma_mc_simd(c_.simd_for(SimdPrimitive::LumaMc),dst.y.data()+static_cast<size_t>(by)*dst.width+bx,dst.width,
                                      ref.y,ref.width,ref.height,bx,by,8,8,
@@ -570,7 +594,7 @@ void Vc1Encoder::motion_compensate_4mv_padded(Frame& dst,const Frame& ref,int mx
         const MotionVector cmv=chroma_mv_4mv(mv);
         const int dcw=dst.width/2,rw=ref.width/2,rh=ref.height/2,cx0=mx*8,cy0=my*8;
         bool udone=false,vdone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             udone=try_chroma_mc_simd(c_.simd_for(SimdPrimitive::ChromaMc),dst.u.data()+static_cast<size_t>(cy0)*dcw+cx0,dcw,ref.u,rw,rh,
                                     cx0,cy0,8,8,cmv.xq,cmv.yq,false,c_.rndctrl,false);
@@ -603,7 +627,7 @@ void Vc1Encoder::motion_compensate_mb_padded(Frame& dst,const Frame& ref,int mx,
             return;
         }
         bool ydone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None)
             ydone=try_luma_mc_simd(c_.simd_for(SimdPrimitive::LumaMc),dst.y.data()+static_cast<size_t>(y0)*dst.width+x0,dst.width,
                                  ref.y,ref.width,ref.height,x0,y0,16,16,mv.xq,mv.yq,c_.rndctrl,
@@ -616,7 +640,7 @@ void Vc1Encoder::motion_compensate_mb_padded(Frame& dst,const Frame& ref,int mx,
         }
         const int dcw=dst.width/2,rw=ref.width/2,rh=ref.height/2,cx0=mx*8,cy0=my*8;
         bool udone=false,vdone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             udone=try_chroma_mc_simd(c_.simd_for(SimdPrimitive::ChromaMc),dst.u.data()+static_cast<size_t>(cy0)*dcw+cx0,dcw,ref.u,rw,rh,
                                     cx0,cy0,8,8,mv.xq,mv.yq,false,c_.rndctrl,false);
@@ -640,7 +664,7 @@ void Vc1Encoder::motion_compensate_bi_mb(Frame& dst,const Frame& past,const Fram
         const int bw=std::max(0,std::min(16,c_.width-x0));
         const int bh=std::max(0,std::min(16,c_.height-y0));
         bool ydone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             uint8_t* dp=dst.y.data()+static_cast<size_t>(y0)*c_.width+x0;
             const bool first=try_luma_mc_simd(c_.simd_for(SimdPrimitive::LumaMc),dp,c_.width,past.y,c_.width,c_.height,x0,y0,bw,bh,
@@ -659,7 +683,7 @@ void Vc1Encoder::motion_compensate_bi_mb(Frame& dst,const Frame& past,const Fram
         const int cw=c_.width/2,ch=c_.height/2,cx0=mx*8,cy0=my*8;
         const int cbw=std::max(0,std::min(8,cw-cx0)),cbh=std::max(0,std::min(8,ch-cy0));
         bool udone=false,vdone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             uint8_t* udp=dst.u.data()+static_cast<size_t>(cy0)*cw+cx0;
             uint8_t* vdp=dst.v.data()+static_cast<size_t>(cy0)*cw+cx0;
@@ -691,7 +715,7 @@ void Vc1Encoder::motion_compensate_bi_mb_padded(Frame& dst,const Frame& past,con
     SpeedProfileScope speed_scope(c_.speed_profiler,SpeedProfileOp::MotionComp);
         const int x0=mx*16,y0=my*16;
         bool ydone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             uint8_t* dp=dst.y.data()+static_cast<size_t>(y0)*dst.width+x0;
             const bool first=try_luma_mc_simd(c_.simd_for(SimdPrimitive::LumaMc),dp,dst.width,past.y,past.width,past.height,x0,y0,16,16,
@@ -709,7 +733,7 @@ void Vc1Encoder::motion_compensate_bi_mb_padded(Frame& dst,const Frame& past,con
         }
         const int dcw=dst.width/2,pw=past.width/2,ph=past.height/2,fw=future.width/2,fh=future.height/2,cx0=mx*8,cy0=my*8;
         bool udone=false,vdone=false;
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (c_.simd_for(SimdPrimitive::LumaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMc)!=SimdTier::None || c_.simd_for(SimdPrimitive::LumaMcAvg)!=SimdTier::None || c_.simd_for(SimdPrimitive::ChromaMcAvg)!=SimdTier::None) {
             uint8_t* udp=dst.u.data()+static_cast<size_t>(cy0)*dcw+cx0;
             uint8_t* vdp=dst.v.data()+static_cast<size_t>(cy0)*dcw+cx0;

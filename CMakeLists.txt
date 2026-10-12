@@ -16,6 +16,8 @@ option(LIBVC1_BUILD_FRONTEND "Build vc1enc command-line frontend" ON)
 option(LIBVC1_FRONTEND_LINK_STATIC "Link vc1enc against the static libvc1 target" OFF)
 option(LIBVC1_BUILD_TESTS "Build libvc1 API tests" ON)
 option(LIBVC1_ENABLE_X86_SIMD "Build x86 SIMD dispatch targets when supported" ON)
+option(LIBVC1_ENABLE_AARCH64_NEON "Build AArch64 NEON kernels when supported" ON)
+option(LIBVC1_ENABLE_AARCH64_EXTENSIONS "Build AArch64 dot-product and RDM kernels when supported" ON)
 option(LIBVC1_ENABLE_MATROSKA "Enable MKV output through official libmatroska/libebml" ON)
 option(LIBVC1_ENABLE_VULKAN "Enable optional Vulkan compute acceleration" ON)
 option(LIBVC1_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -85,6 +87,7 @@ set(LIBVC1_COMMON_SOURCES
     src/encoder_encode.cpp
     src/encoder_interlaced.cpp
     src/encoder_motion.cpp
+    src/encoder_motion_diamond.cpp
     src/encoder_motion_compensation.cpp
     src/encoder_transform.cpp
     src/encoder_aq.cpp
@@ -148,6 +151,37 @@ if (LIBVC1_ENABLE_X86_SIMD AND LIBVC1_PROCESSOR_LOWER MATCHES "^(x86_64|amd64)$"
     libvc1_add_x86_simd_target(x86_v4 x86-64-v4 src/simd_x86_v4.cpp LIBVC1_HAVE_V4)
 endif()
 
+# NEON is a baseline architectural feature of AArch64, with no need for
+# -mcpu=native, SVE, or host-specific instructions in the portable binary.
+if (LIBVC1_ENABLE_AARCH64_NEON AND LIBVC1_PROCESSOR_LOWER MATCHES "^(aarch64|arm64)$" AND NOT MSVC)
+    add_library(libvc1_simd_aarch64_neon OBJECT src/simd_aarch64_neon.cpp src/simd_aarch64_extra.cpp)
+    set_target_properties(libvc1_simd_aarch64_neon PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_features(libvc1_simd_aarch64_neon PRIVATE cxx_std_17)
+    target_compile_options(libvc1_simd_aarch64_neon PRIVATE -ffp-contract=off -fvisibility=hidden -Wall -Wextra -Wpedantic)
+    list(APPEND LIBVC1_SIMD_OBJECTS $<TARGET_OBJECTS:libvc1_simd_aarch64_neon>)
+    set(LIBVC1_HAVE_AARCH64_NEON 1)
+    if (LIBVC1_ENABLE_AARCH64_EXTENSIONS)
+        check_cxx_compiler_flag("-march=armv8.2-a+dotprod" LIBVC1_COMPILER_AARCH64_DOTPROD)
+        if (LIBVC1_COMPILER_AARCH64_DOTPROD)
+            add_library(libvc1_simd_aarch64_dotprod OBJECT src/simd_aarch64_dotprod.cpp)
+            set_target_properties(libvc1_simd_aarch64_dotprod PROPERTIES POSITION_INDEPENDENT_CODE ON)
+            target_compile_features(libvc1_simd_aarch64_dotprod PRIVATE cxx_std_17)
+            target_compile_options(libvc1_simd_aarch64_dotprod PRIVATE -march=armv8.2-a+dotprod -ffp-contract=off -fvisibility=hidden -Wall -Wextra -Wpedantic)
+            list(APPEND LIBVC1_SIMD_OBJECTS $<TARGET_OBJECTS:libvc1_simd_aarch64_dotprod>)
+            set(LIBVC1_HAVE_AARCH64_DOTPROD 1)
+        endif()
+        check_cxx_compiler_flag("-march=armv8.1-a+rdma" LIBVC1_COMPILER_AARCH64_RDM)
+        if (LIBVC1_COMPILER_AARCH64_RDM)
+            add_library(libvc1_simd_aarch64_rdm OBJECT src/simd_aarch64_rdm.cpp)
+            set_target_properties(libvc1_simd_aarch64_rdm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+            target_compile_features(libvc1_simd_aarch64_rdm PRIVATE cxx_std_17)
+            target_compile_options(libvc1_simd_aarch64_rdm PRIVATE -march=armv8.1-a+rdma -ffp-contract=off -fvisibility=hidden -Wall -Wextra -Wpedantic)
+            list(APPEND LIBVC1_SIMD_OBJECTS $<TARGET_OBJECTS:libvc1_simd_aarch64_rdm>)
+            set(LIBVC1_HAVE_AARCH64_RDM 1)
+        endif()
+    endif()
+endif()
+
 function(libvc1_configure_target target)
     target_sources(${target} PRIVATE ${LIBVC1_COMMON_SOURCES} ${LIBVC1_SIMD_OBJECTS})
     target_compile_features(${target} PRIVATE cxx_std_17)
@@ -162,6 +196,18 @@ function(libvc1_configure_target target)
         target_compile_definitions(${target} PRIVATE LIBVC1_HAVE_VULKAN=1)
         target_include_directories(${target} PRIVATE "${LIBVC1_VULKAN_GENERATED_DIR}")
         target_link_libraries(${target} PRIVATE Vulkan::Vulkan)
+    endif()
+    if (LIBVC1_HAVE_AARCH64_NEON)
+        target_compile_definitions(${target} PRIVATE LIBVC1_HAVE_AARCH64_NEON=1)
+        # Keep scalar and NEON double-precision transform accumulation on the
+        # same unfused arithmetic path for SIMD/scalar output comparisons.
+        target_compile_options(${target} PRIVATE -ffp-contract=off)
+    endif()
+    if (LIBVC1_HAVE_AARCH64_DOTPROD)
+        target_compile_definitions(${target} PRIVATE LIBVC1_HAVE_AARCH64_DOTPROD=1)
+    endif()
+    if (LIBVC1_HAVE_AARCH64_RDM)
+        target_compile_definitions(${target} PRIVATE LIBVC1_HAVE_AARCH64_RDM=1)
     endif()
     if (LIBVC1_HAVE_V1)
         target_compile_definitions(${target} PRIVATE LIBVC1_HAVE_X86_64_V1=1)
@@ -271,6 +317,22 @@ endif()
 
 if (LIBVC1_BUILD_TESTS)
     enable_testing()
+
+    if (LIBVC1_HAVE_AARCH64_NEON)
+        add_executable(libvc1_simd_aarch64_neon_test tests/simd_aarch64_neon.cpp
+            $<TARGET_OBJECTS:libvc1_simd_aarch64_neon>)
+        if (LIBVC1_HAVE_AARCH64_DOTPROD)
+            target_sources(libvc1_simd_aarch64_neon_test PRIVATE $<TARGET_OBJECTS:libvc1_simd_aarch64_dotprod>)
+            target_compile_definitions(libvc1_simd_aarch64_neon_test PRIVATE LIBVC1_HAVE_AARCH64_DOTPROD=1)
+        endif()
+        if (LIBVC1_HAVE_AARCH64_RDM)
+            target_sources(libvc1_simd_aarch64_neon_test PRIVATE $<TARGET_OBJECTS:libvc1_simd_aarch64_rdm>)
+            target_compile_definitions(libvc1_simd_aarch64_neon_test PRIVATE LIBVC1_HAVE_AARCH64_RDM=1)
+        endif()
+        target_compile_features(libvc1_simd_aarch64_neon_test PRIVATE cxx_std_17)
+        target_include_directories(libvc1_simd_aarch64_neon_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME libvc1-simd-aarch64-neon COMMAND libvc1_simd_aarch64_neon_test)
+    endif()
 
     # Native is the historical/default behavior.  In qemu-fallback mode each
     # ISA-specific test executes directly first and only exit 77 (unsupported
@@ -605,6 +667,16 @@ if (LIBVC1_BUILD_TESTS)
     endif()
     add_test(NAME libvc1-visible-edge-inter COMMAND libvc1_visible_edge_inter)
 
+    add_executable(libvc1_hidden_reference_guard tests/hidden_reference_guard.cpp)
+    target_compile_features(libvc1_hidden_reference_guard PRIVATE cxx_std_17)
+    target_include_directories(libvc1_hidden_reference_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if (TARGET vc1_static)
+        target_link_libraries(libvc1_hidden_reference_guard PRIVATE vc1_static)
+    else()
+        target_link_libraries(libvc1_hidden_reference_guard PRIVATE vc1)
+    endif()
+    add_test(NAME libvc1-hidden-reference-guard COMMAND libvc1_hidden_reference_guard)
+
     add_executable(libvc1_staged_motion_estimation tests/staged_motion_estimation.cpp)
     target_compile_features(libvc1_staged_motion_estimation PRIVATE cxx_std_17)
     target_include_directories(libvc1_staged_motion_estimation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -614,6 +686,22 @@ if (LIBVC1_BUILD_TESTS)
         target_link_libraries(libvc1_staged_motion_estimation PRIVATE vc1)
     endif()
     add_test(NAME libvc1-staged-motion-estimation COMMAND libvc1_staged_motion_estimation)
+
+    # Standalone, bit-exact residual-gradient SIMD parity (SSE2/NEON/scalar).
+    add_executable(libvc1_transform_metrics_simd tests/transform_metrics_simd.cpp)
+    target_compile_features(libvc1_transform_metrics_simd PRIVATE cxx_std_17)
+    target_include_directories(libvc1_transform_metrics_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME libvc1-transform-metrics-simd COMMAND libvc1_transform_metrics_simd)
+
+    add_executable(libvc1_diamond_motion tests/diamond_motion.cpp)
+    target_compile_features(libvc1_diamond_motion PRIVATE cxx_std_17)
+    target_include_directories(libvc1_diamond_motion PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if (TARGET vc1_static)
+        target_link_libraries(libvc1_diamond_motion PRIVATE vc1_static)
+    else()
+        target_link_libraries(libvc1_diamond_motion PRIVATE vc1)
+    endif()
+    add_test(NAME libvc1-diamond-motion COMMAND libvc1_diamond_motion)
 
     if (LIBVC1_HAVE_VULKAN)
         add_executable(libvc1_vulkan_compute_runtime tests/vulkan_compute_runtime.cpp)
@@ -758,6 +846,10 @@ if (LIBVC1_BUILD_TESTS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_debug_statistics.cmake)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (LIBVC1_HAVE_AARCH64_NEON AND Python3_Interpreter_FOUND AND TARGET vc1enc)
+        add_test(NAME libvc1-simd-aarch64-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd_aarch64_runtime.py $<TARGET_FILE:vc1enc>)
+    endif()
     if (Python3_Interpreter_FOUND)
         add_test(NAME libvc1-simd-qemu-runner-selftest
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd_qemu_runner_selftest.py)
@@ -767,6 +859,14 @@ if (LIBVC1_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug_stats_cli.py $<TARGET_FILE:vc1enc>)
         add_test(NAME libvc1-frame-weight-runtime
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/frame_weight_runtime.py $<TARGET_FILE:vc1enc>)
+        add_test(NAME libvc1-content-presets-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/content_presets_runtime.py $<TARGET_FILE:vc1enc>)
+        add_test(NAME libvc1-fast-preset-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/fast_preset_runtime.py $<TARGET_FILE:vc1enc>)
+        add_test(NAME libvc1-b-fast-validation-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/b_fast_validation_runtime.py $<TARGET_FILE:vc1enc>)
+        add_test(NAME libvc1-subpixel-range-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/subpixel_range_runtime.py $<TARGET_FILE:vc1enc>)
         add_test(NAME libvc1-two-pass-runtime
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/two_pass_runtime.py $<TARGET_FILE:vc1enc>)
         add_test(NAME libvc1-bluray-two-pass-peak-runtime
@@ -884,6 +984,12 @@ if (LIBVC1_BUILD_TESTS)
                 $<TARGET_FILE:vc1enc> ${LIBVC1_FFMPEG_EXECUTABLE})
         add_test(NAME libvc1-overlap-condover-runtime
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/overlap_runtime.py
+                $<TARGET_FILE:vc1enc> ${LIBVC1_FFMPEG_EXECUTABLE})
+        add_test(NAME libvc1-partial-edge-overlap-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/partial_edge_overlap_runtime.py
+                $<TARGET_FILE:vc1enc> ${LIBVC1_FFMPEG_EXECUTABLE})
+        add_test(NAME libvc1-overlap-edge-padding-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/overlap_edge_padding_runtime.py
                 $<TARGET_FILE:vc1enc> ${LIBVC1_FFMPEG_EXECUTABLE})
         add_test(NAME libvc1-skipped-picture-runtime
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/skipped_picture_runtime.py

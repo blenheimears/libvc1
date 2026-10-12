@@ -4,6 +4,38 @@
 
 namespace libvc1::simd {
 
+// AArch64 baseline Advanced SIMD (NEON): all 20 encoder benchmark primitives.
+uint64_t frame_sad_aarch64_neon(const uint8_t*,int,const uint8_t*,int,int,int,int,int,int);
+uint64_t block_sad_aarch64_neon(const uint8_t*,int,const uint8_t*,int,int,int,int);
+void forward_transform_intra8_aarch64_neon(const uint8_t*,int,double*,bool);
+void forward_transform_residual8_aarch64_neon(const uint8_t*,const uint8_t*,int,double*,bool);
+void forward_transform_residual_rect_aarch64_neon(const uint8_t*,const uint8_t*,int,int,int,double*,bool);
+void put_block8_aarch64_neon(uint8_t*,int,const int*,int);
+void add_block_rect_aarch64_neon(uint8_t*,int,const int*,int,int);
+uint64_t sum_u8_aarch64_neon(const uint8_t*,size_t);
+uint64_t satd4x4_aarch64_neon(const uint8_t*,int,const uint8_t*,int);
+
+// Remaining AArch64 NEON SIMD families (VC-1 exact integer rounding).
+void inverse_transform_8x8_aarch64_neon(int*);
+uint64_t block_sad_luma_qpel_aarch64_neon(const uint8_t*,int,const uint8_t*,int,int,int,int,int,bool);
+uint64_t block_sad_luma_bilinear_aarch64_neon(const uint8_t*,int,const uint8_t*,int,int,int,bool,bool,bool);
+void luma_mc_block_aarch64_neon(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool,bool);
+void luma_mc_block_avg_aarch64_neon(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool,bool);
+void chroma_mc_block_aarch64_neon(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool);
+void chroma_mc_block_avg_aarch64_neon(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool);
+void intensity_map_plane_aarch64_neon(uint8_t*,const uint8_t*,size_t,int,int);
+void intensity_map_chroma_plane_aarch64_neon(uint8_t*,const uint8_t*,size_t,int);
+// Dedicated optional-ISA objects: never call without a runtime HWCAP check.
+uint64_t block_sad_luma_qpel_aarch64_dotprod(const uint8_t*,int,const uint8_t*,int,int,int,int,int,bool);
+void luma_mc_block_aarch64_dotprod(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool,bool);
+void luma_mc_block_avg_aarch64_dotprod(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool,bool);
+void chroma_mc_block_aarch64_dotprod(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool);
+void chroma_mc_block_avg_aarch64_dotprod(uint8_t*,int,const uint8_t*,int,int,int,int,int,bool);
+void intensity_map_plane_aarch64_rdm(uint8_t*,const uint8_t*,size_t,int,int);
+void intensity_map_chroma_plane_aarch64_rdm(uint8_t*,const uint8_t*,size_t,int);
+void quantize_coefficients_aarch64_neon(const double*,int*,int,double,double,int);
+void perceptual_stats_aarch64_neon(const uint8_t*,const uint8_t*,int,int,int,uint64_t*,uint64_t*,uint64_t*,int*,int*,int*,int*);
+
 // x86-64-v1 baseline acceleration kernels.  These use only SSE2, which is
 // mandatory on every x86-64 CPU; the translation unit is compiled with -march=x86-64.
 uint64_t frame_sad_x86_64_v1(const uint8_t* cur, int cur_stride,

@@ -1,5 +1,6 @@
 #include "encoder_internal.h"
 #include "forward_transform_tables.h"
+#include "transform_residual_metrics.h"
 
 namespace libvc1 {
 
@@ -523,6 +524,9 @@ QuantizerType Vc1Encoder::choose_picture_quantizer_type(const Frame& f) const {
     }
 
 void Vc1Encoder::inverse_transform_8x8(std::array<int,64>& block) const {
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::Inverse8x8)==SimdTier::AArch64Neon) { simd::inverse_transform_8x8_aarch64_neon(block.data()); return; }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (c_.simd_for(SimdPrimitive::Inverse8x8)==SimdTier::X86V4) { simd::inverse_transform_8x8_x86_64_v4(block.data()); return; }
 #endif
@@ -607,6 +611,11 @@ void Vc1Encoder::inverse_transform_8x8(std::array<int,64>& block) const {
 
 void Vc1Encoder::put_block(std::vector<uint8_t>& dst,int w,int h,int x0,int y0,
                    const std::array<int,64>& block,int bias) const {
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::PutBlock8)==SimdTier::AArch64Neon && x0>=0 && y0>=0 && x0+8<=w && y0+8<=h) {
+            simd::put_block8_aarch64_neon(dst.data()+static_cast<size_t>(y0)*w+x0,w,block.data(),bias); return;
+        }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (c_.simd_for(SimdPrimitive::PutBlock8)==SimdTier::X86V4 && x0>=0 && y0>=0 && x0+8<=w && y0+8<=h) { simd::put_block8_x86_64_v4(dst.data()+static_cast<size_t>(y0)*w+x0,w,block.data(),bias); return; }
 #endif
@@ -662,9 +671,14 @@ void Vc1Encoder::add_block(std::vector<uint8_t>& dst,int w,int h,int x0,int y0,
 
 std::array<double,64> Vc1Encoder::forward_transform(const std::vector<uint8_t>& p,
                                              int w, int h, int x0, int y0, int pad_sample) const {
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (x0>=0 && y0>=0 && x0+8<=w && y0+8<=h) {
             std::array<double,64> c{};
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+            if (c_.simd_for(SimdPrimitive::ForwardIntra8)==SimdTier::AArch64Neon) {
+                simd::forward_transform_intra8_aarch64_neon(p.data()+static_cast<size_t>(y0)*w+x0,w,c.data(),false); return c;
+            }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
             if (c_.simd_for(SimdPrimitive::ForwardIntra8)==SimdTier::X86V4) {
                 simd::forward_transform_intra8_x86_64_v4(
@@ -783,10 +797,15 @@ std::array<double,64> Vc1Encoder::forward_transform(const std::vector<uint8_t>& 
 std::array<double,64> Vc1Encoder::forward_transform_residual(const std::vector<uint8_t>& src,
                                                       const std::vector<uint8_t>& pred,
                                                       int w,int h,int x0,int y0) const {
-#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4)
+#if defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_AARCH64_NEON)
         if (x0>=0 && y0>=0 && x0+8<=w && y0+8<=h) {
             std::array<double,64> c{};
             const size_t off=static_cast<size_t>(y0)*w+x0;
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+            if (c_.simd_for(SimdPrimitive::ForwardResidual8)==SimdTier::AArch64Neon) {
+                simd::forward_transform_residual8_aarch64_neon(src.data()+off,pred.data()+off,w,c.data(),false); return c;
+            }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
             if (c_.simd_for(SimdPrimitive::ForwardResidual8)==SimdTier::X86V4) {
                 simd::forward_transform_residual8_x86_64_v4(src.data()+off,pred.data()+off,w,c.data(),c_.simd_fma_for(SimdPrimitive::ForwardResidual8));
@@ -918,6 +937,13 @@ std::array<double,64> Vc1Encoder::forward_transform_residual_part(const std::vec
                                                            int w,int h,int x0,int y0,
                                                            int bw,int bh) const {
         if (bw==8 && bh==8) return forward_transform_residual(src,pred,w,h,x0,y0);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::ForwardResidualRect)==SimdTier::AArch64Neon &&
+            x0>=0 && y0>=0 && x0+bw<=w && y0+bh<=h && (bw==4 || bw==8) && (bh==4 || bh==8)) {
+            std::array<double,64> c{}; const size_t off=static_cast<size_t>(y0)*w+x0;
+            simd::forward_transform_residual_rect_aarch64_neon(src.data()+off,pred.data()+off,w,bw,bh,c.data(),false); return c;
+        }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (c_.simd_for(SimdPrimitive::ForwardResidualRect)==SimdTier::X86V4 && x0>=0 && y0>=0 && x0+bw<=w && y0+bh<=h && (bw==4 || bw==8) && (bh==4 || bh==8)) {
             std::array<double,64> c{}; const size_t off=static_cast<size_t>(y0)*w+x0;
@@ -1083,13 +1109,16 @@ std::array<int,64> Vc1Encoder::quantize_inter_part(const std::vector<uint8_t>& s
             const double lscale=perceptual_lambda_scale(src,w,h,x0,y0,bw,bh,&pred,nullptr,luma_context);
             q=trellis_quantize(coeff,scan,n,0,type,false,lscale,mquant);
         } else {
-#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1)
+#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_AARCH64_NEON)
             const SimdTier qt=c_.simd_for(SimdPrimitive::Quantize);
-            if (qt==SimdTier::X86V4 || qt==SimdTier::X86V3 || qt==SimdTier::Avx2Partial || qt==SimdTier::Piledriver || qt==SimdTier::Bulldozer || qt==SimdTier::SandyBridge || qt==SimdTier::X86V2 || qt==SimdTier::Penryn || qt==SimdTier::Conroe || qt==SimdTier::K10 || qt==SimdTier::Prescott || qt==SimdTier::X86V1) {
+            if (qt==SimdTier::AArch64Neon || qt==SimdTier::X86V4 || qt==SimdTier::X86V3 || qt==SimdTier::Avx2Partial || qt==SimdTier::Piledriver || qt==SimdTier::Bulldozer || qt==SimdTier::SandyBridge || qt==SimdTier::X86V2 || qt==SimdTier::Penryn || qt==SimdTier::Conroe || qt==SimdTier::K10 || qt==SimdTier::Prescott || qt==SimdTier::X86V1) {
                 const bool derived=mquant!=c_.pqindex;
                 const double qs=static_cast<double>(picture_double_quant(mquant,derived));
                 const double off=uniform_quantizer()?0.0:static_cast<double>(mquant);
                 auto qrow=[&](const double* in,int* out,int count) {
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+                    if (qt==SimdTier::AArch64Neon) { simd::quantize_coefficients_aarch64_neon(in,out,count,qs,off,max_quantized_level()); return; }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
                     if (qt==SimdTier::X86V4) { simd::quantize_coefficients_x86_64_v4(in,out,count,qs,off,max_quantized_level()); return; }
 #endif
@@ -1262,6 +1291,12 @@ void Vc1Encoder::add_partition(std::vector<uint8_t>& dst,int w,int h,int x0,int 
         int ox=0,oy=0,bw=8,bh=8;
         transform_part_geometry(t,part,ox,oy,bw,bh);
         const auto r=inverse_partition(t,q,mquant,dquant_derived);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::AddBlockRect)==SimdTier::AArch64Neon &&
+            x0+ox>=0 && y0+oy>=0 && x0+ox+bw<=w && y0+oy+bh<=h) {
+            simd::add_block_rect_aarch64_neon(dst.data()+static_cast<size_t>(y0+oy)*w+x0+ox,w,r.data(),bw,bh); return;
+        }
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
         if (c_.simd_for(SimdPrimitive::AddBlockRect)==SimdTier::X86V4 && x0+ox>=0 && y0+oy>=0 && x0+ox+bw<=w && y0+oy+bh<=h) { simd::add_block_rect_x86_64_v4(dst.data()+static_cast<size_t>(y0+oy)*w+x0+ox,w,r.data(),bw,bh); return; }
 #endif
@@ -1572,6 +1607,31 @@ MbTransformDecision Vc1Encoder::choose_transform_mb(const Frame& src,const Frame
                                             const TransformPicturePlan* picture_plan) const {
     SpeedProfileScope speed_scope(c_.speed_profiler,SpeedProfileOp::TransformRdo);
         if (mquant < 1) mquant=c_.pqindex;
+        if (!c_.variable_transforms && c_.fast_transform_rdo && !c_.dquant &&
+            c_.trellis==0 && c_.me_quality!=VC1_ME_RD && !c_.debug_macroblock_stats) {
+            // There is no transform alternative, no per-MB Q trial, and no
+            // codec-aware motion finalist. The inverse transform/SSE and
+            // BitWriter payload estimates cannot change a decision. Generate
+            // exactly the same six quantized 8x8 coefficient sets and CBP,
+            // leaving the real reconstruction and entropy writer untouched.
+            MbTransformDecision d;
+            for (int k=0;k<6;++k) {
+                const bool chroma=k>=4;
+                const auto& sp=chroma?(k==4?src.u:src.v):src.y;
+                const auto& pp=chroma?(k==4?pred.u:pred.v):pred.y;
+                const int w=chroma?c_.width/2:c_.width;
+                const int h=chroma?c_.height/2:c_.height;
+                const int bx=chroma?mx:mx*2+(k&1);
+                const int by=chroma?my:my*2+((k>>1)&1);
+                const auto q=quantize_inter_part(sp,pp,w,h,bx*8,by*8,8,8,
+                                                 false,mquant,chroma?&src.y:nullptr);
+                auto& parent=d.parents[static_cast<size_t>(k)];
+                store_parent_part(parent,TransformType::T8x8,0,q);
+                if (!has_any(q)) parent.skip_mask=1;
+                else d.cbp|=static_cast<uint8_t>(1u<<(5-k));
+            }
+            return d;
+        }
         if (!c_.variable_transforms)
             return evaluate_transform_type(src,pred,mx,my,TransformType::T8x8,coding_set,use_vlc,true,mquant,dquantfrm);
 
@@ -1583,33 +1643,16 @@ MbTransformDecision Vc1Encoder::choose_transform_mb(const Frame& src,const Frame
             return d;
         }
 
-        uint64_t sad=0, hedge=0, vedge=0, grad=0;
-        for (int py=0;py<16 && my*16+py<c_.height;++py) {
-            for (int px=0;px<16 && mx*16+px<c_.width;++px) {
-                const int x=mx*16+px,y=my*16+py;
-                const size_t o=static_cast<size_t>(y)*c_.width+x;
-                const int r=static_cast<int>(src.y[o])-static_cast<int>(pred.y[o]);
-                sad+=static_cast<uint64_t>(std::abs(r));
-                if ((py&7)==4 && py>0) {
-                    const size_t u=static_cast<size_t>(y-1)*c_.width+x;
-                    const int rp=static_cast<int>(src.y[u])-static_cast<int>(pred.y[u]);
-                    hedge+=static_cast<uint64_t>(std::abs(r-rp));
-                }
-                if ((px&7)==4 && px>0) {
-                    const size_t l=static_cast<size_t>(y)*c_.width+x-1;
-                    const int rp=static_cast<int>(src.y[l])-static_cast<int>(pred.y[l]);
-                    vedge+=static_cast<uint64_t>(std::abs(r-rp));
-                }
-                if (px>0) {
-                    const size_t l=o-1; const int rp=static_cast<int>(src.y[l])-static_cast<int>(pred.y[l]);
-                    grad+=static_cast<uint64_t>(std::abs(r-rp));
-                }
-                if (py>0) {
-                    const size_t u=o-c_.width; const int rp=static_cast<int>(src.y[u])-static_cast<int>(pred.y[u]);
-                    grad+=static_cast<uint64_t>(std::abs(r-rp));
-                }
-            }
-        }
+        // SIMD acceleration applies to the new one-candidate transform heuristic.
+        // Preserve the 0.2.63 scalar metrics for full-RDO modes and partial
+        // macroblocks. The BlockSad dispatch is the explicit SIMD on/off gate.
+        const SimdTier metric_tier = (c_.fast_transform_rdo && c_.trellis==0 &&
+                                     !c_.dquant && c_.me_quality!=VC1_ME_RD)
+            ? c_.simd_for(SimdPrimitive::BlockSad) : SimdTier::None;
+        const auto metrics=transform_metrics::calculate(src.y.data(),pred.y.data(),
+                                                         c_.width,c_.height,mx,my,metric_tier);
+        const uint64_t sad=metrics.sad, hedge=metrics.hedge,
+                       vedge=metrics.vedge, grad=metrics.grad;
         std::array<TransformType,4> list{TransformType::T8x8,TransformType::T8x8,TransformType::T8x8,TransformType::T8x8};
         int count=0;
         const int mbw=(c_.width+15)/16, mbh=(c_.height+15)/16;
@@ -1639,6 +1682,34 @@ MbTransformDecision Vc1Encoder::choose_transform_mb(const Frame& src,const Frame
                 else { list[count++]=TransformType::T8x4; list[count++]=TransformType::T4x8; }
                 if (count<4 && grad > sad*2) list[count++]=TransformType::T4x4;
             }
+        }
+
+        // The throughput preset keeps all four transform shapes but selects
+        // one from the residual strength/direction heuristic above. This
+        // avoids quantizing/reconstructing multiple candidates solely to
+        // discard all but one, and avoids a second TTBLK-vs-TTMB RDO pass.
+        // Restrict the choice to the candidate list: partial-frame edge
+        // macroblocks MUST use their split shape to protect hidden pixels.
+        // The selected type still goes through real quantization, bit-cost
+        // estimation, coefficient writing and reconstruction.
+        if (c_.fast_transform_rdo && c_.trellis==0 && !c_.dquant &&
+            c_.me_quality!=VC1_ME_RD) {
+            TransformType chosen=list[0];
+            if (count>1) {
+                int index=count-1;
+                // 4x4 needs an especially strong texture/edge signal before
+                // paying its extra coefficient and subblock syntax overhead.
+                // For a corner crop it is the only allowed candidate, so the
+                // count==1 path above always retains the necessary split.
+                if (list[index]==TransformType::T4x4 && grad*2<=sad*5)
+                    --index;
+                chosen=list[index];
+                if (chosen==TransformType::T4x8 && index>0 &&
+                    list[index-1]==TransformType::T8x4 && hedge>=vedge)
+                    chosen=TransformType::T8x4;
+            }
+            return evaluate_transform_type(src,pred,mx,my,chosen,coding_set,use_vlc,
+                                           false,mquant,dquantfrm);
         }
 
         const bool scalar_search=c_.trellis>0;
@@ -1808,9 +1879,12 @@ std::array<int,64> Vc1Encoder::trellis_quantize(const std::array<double,64>& coe
         const bool dquant_derived=mquant!=c_.pqindex;
         const double qscale=static_cast<double>(picture_double_quant(mquant,dquant_derived));
         const int max_level=max_quantized_level();
-#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1)
-        if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V3 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Avx2Partial || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Piledriver || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Bulldozer || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::SandyBridge || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V2 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Penryn || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Conroe || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::K10 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Prescott || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V1) {
+#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::AArch64Neon || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V3 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Avx2Partial || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Piledriver || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Bulldozer || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::SandyBridge || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V2 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Penryn || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Conroe || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::K10 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Prescott || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V1) {
             const double off=uniform_quantizer()?0.0:static_cast<double>(mquant);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+            if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::AArch64Neon) simd::quantize_coefficients_aarch64_neon(coeff.data(),scalar.data(),64,qscale,off,max_level);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
             if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4) simd::quantize_coefficients_x86_64_v4(coeff.data(),scalar.data(),64,qscale,off,max_level);
 #endif
@@ -1862,13 +1936,13 @@ std::array<int,64> Vc1Encoder::trellis_quantize(const std::array<double,64>& coe
         // rate-distortion tradeoff instead of a bitrate target.
         if (c_.trellis<=0 || (c_.hrd_enabled && mquant==1)) return scalar;
 
-        struct PathNode { int prev=-1; int scan_pos=-1; int level=0; };
+        struct PathNode { int prev; int scan_pos; int level; };
         struct State {
-            double distortion=0.0;
-            uint32_t provisional_bits=0;
-            int last_scan=0;
-            int node=-1;
-            double score=0.0;
+            double distortion;
+            uint32_t provisional_bits;
+            int last_scan;
+            int node;
+            double score;
         };
         struct RateCacheEntry {
             int run=-1;
@@ -1884,11 +1958,15 @@ std::array<int,64> Vc1Encoder::trellis_quantize(const std::array<double,64>& coe
         // beam/path workspace on the stack: the old vectors allocated and freed
         // storage for every part even though the maximum beam is fixed at eight.
         // There are at most three non-zero descendants per state/scan position.
-        std::array<PathNode,64*8*3> nodes{};
+        // Each node is filled before it is linked into a state.  Avoid clearing
+        // the entire ~18 KiB path array on *every* trellis call; only the first
+        // node_count elements can ever be read.
+        std::array<PathNode,64*8*3> nodes;
         size_t node_count=0;
         std::array<State,8> states{};
         size_t state_count=1;
         states[0].last_scan=first_scan-1;
+        states[0].node=-1;
         std::array<RateCacheEntry,128> rate_cache{};
         auto cached_rate=[&](int run,int level,bool last) {
             const int magnitude=std::abs(level);
@@ -1936,7 +2014,10 @@ std::array<int,64> Vc1Encoder::trellis_quantize(const std::array<double,64>& coe
                 candidate_dist[static_cast<size_t>(ci)]=e*e*trellis_coeff_weight(type,idx);
             }
 
-            std::array<State,32> next{};
+            // All next[0..next_count) entries are assigned before sorting or
+            // copying.  Clearing 32 states for each of 64 scan positions is
+            // unnecessary and can dominate sparse blocks.
+            std::array<State,32> next;
             size_t next_count=0;
             for (size_t si=0;si<state_count;++si) {
                 const State& st=states[si];
@@ -2019,10 +2100,13 @@ std::array<int,64> Vc1Encoder::quantize_ac(const std::vector<uint8_t>& p,
                                                         chroma?luma_context:nullptr);
             q=trellis_quantize(coeff,scan,64,1,TransformType::T8x8,!chroma,lscale,mquant);
         } else {
-#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1)
-            if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V3 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Avx2Partial || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Piledriver || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Bulldozer || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::SandyBridge || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V2 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Penryn || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Conroe || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::K10 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Prescott || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V1) {
+#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_AARCH64_NEON)
+            if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::AArch64Neon || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V3 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Avx2Partial || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Piledriver || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Bulldozer || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::SandyBridge || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V2 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Penryn || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Conroe || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::K10 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Prescott || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V1) {
                 const double qs=static_cast<double>(picture_double_quant(mquant,dquant_derived));
                 const double off=uniform_quantizer()?0.0:static_cast<double>(mquant);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+            if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::AArch64Neon) simd::quantize_coefficients_aarch64_neon(coeff.data(),q.data(),64,qs,off,max_quantized_level());
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
                 if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4) simd::quantize_coefficients_x86_64_v4(coeff.data(),q.data(),64,qs,off,max_quantized_level());
 #endif
@@ -2075,10 +2159,13 @@ std::array<int,64> Vc1Encoder::quantize_inter(const std::vector<uint8_t>& src,
         std::array<int,64> q{};
         const int mq=mquant<1?c_.pqindex:mquant;
         const bool derived=dquant_derived || mq!=c_.pqindex;
-#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1)
-        if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V3 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Avx2Partial || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Piledriver || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Bulldozer || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::SandyBridge || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V2 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Penryn || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Conroe || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::K10 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Prescott || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V1) {
+#if defined(LIBVC1_HAVE_X86_64_V4) || defined(LIBVC1_HAVE_X86_64_V3) || defined(LIBVC1_HAVE_SANDYBRIDGE) || defined(LIBVC1_HAVE_X86_64_V2) || defined(LIBVC1_HAVE_PENRYN) || defined(LIBVC1_HAVE_CONROE) || defined(LIBVC1_HAVE_PRESCOTT) || defined(LIBVC1_HAVE_X86_64_V1) || defined(LIBVC1_HAVE_AARCH64_NEON)
+        if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::AArch64Neon || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V3 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Avx2Partial || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Piledriver || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Bulldozer || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::SandyBridge || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V2 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Penryn || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Conroe || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::K10 || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::Prescott || c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V1) {
             const double qs=static_cast<double>(picture_double_quant(mq,derived));
             const double off=uniform_quantizer()?0.0:static_cast<double>(mq);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+            if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::AArch64Neon) simd::quantize_coefficients_aarch64_neon(coeff.data(),q.data(),64,qs,off,max_quantized_level());
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V4)
             if (c_.simd_for(SimdPrimitive::Quantize)==SimdTier::X86V4) simd::quantize_coefficients_x86_64_v4(coeff.data(),q.data(),64,qs,off,max_quantized_level());
 #endif

@@ -32,13 +32,12 @@ struct Plan {
     std::vector<GopPlan> gops;
     int stats_version=1;
 };
-// Allocate against a whole-video elementary-stream bit budget.  Already
-// dispatched GOPs reserve their planned bits so one slow worker cannot make
-// the coordinator promise the same remaining bits to multiple other workers.
-// Committed (actual) sizes replace reservations in strict GOP order.  Only
-// FUTURE plans are rescaled; already returned access units are immutable.
+// Allocate against a whole-video elementary-stream bit budget. The complete
+// pass-1 file is normalized before pass 2 starts, and those GOP targets remain
+// immutable. Actual size error is tracked for diagnostics only; it is never
+// pushed into later GOPs, which prevents end-of-stream quality starvation.
 struct BudgetLedger {
-    std::vector<double> nominal, reserved_by_gop, suffix;
+    std::vector<double> nominal, reserved_by_gop;
     double target_bits=0.0, actual_bits=0.0, reserved_bits=0.0;
     size_t launched=0, committed=0;
     BudgetLedger(const Plan& plan,uint64_t bitrate,int fps_num,int fps_den);

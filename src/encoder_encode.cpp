@@ -2,6 +2,67 @@
 
 namespace libvc1 {
 
+
+// Prepare an intra-only, coded-size source. The bitstream has no per-8x8
+// OVERLAP-edge disable syntax in Main/high-Q Advanced: instead encode a calm
+// continuation of the visible image into the hidden transform, so the decoder
+// applies its normal overlap without mixing black padding into visible pixels.
+// No hidden sample is changed unless an ENABLED boundary's four-tap footprint
+// contains both a visible pixel and padding. The continuation has no variation
+// perpendicular to the affected edge (last row down, last column right).
+static Frame make_overlap_edge_source(const Frame& src,int visible_w,int visible_h,
+                                      const std::vector<uint8_t>& flags,bool all) {
+    const int cw=((src.width+15)/16)*16, ch=((src.height+15)/16)*16;
+    const int mbw=cw/16,mbh=ch/16;
+    if (flags.size()!=static_cast<size_t>(mbw)*mbh)
+        throw std::runtime_error("intra overlap padding: macroblock map mismatch");
+    auto border=[](int visible,int coded) {
+        if(visible<1 || visible>=coded) return -1;
+        const int rem=visible&7;
+        const int edge=rem==7?visible+1:(rem==0?visible:(rem==1?visible-1:-1));
+        return edge>0 && edge<coded ? edge : -1;
+    };
+    const int vx=border(visible_w,cw),vy=border(visible_h,ch);
+    const int ccw=cw/2,cch=ch/2;
+    const int cvw=(visible_w+1)/2,cvh=(visible_h+1)/2;
+    const int cx=border(cvw,ccw),cy=border(cvh,cch);
+    if(vx<0 && vy<0 && cx<0 && cy<0) return {};
+    Frame out;
+    out.width=cw;out.height=ch;
+    out.y.assign(static_cast<size_t>(cw)*ch,0);
+    out.u.assign(static_cast<size_t>(ccw)*cch,128);
+    out.v.assign(out.u.size(),128);
+    auto active=[&](bool luma,int ax,int ay,int bx,int by) {
+        if (all) return true;
+        const int a=(luma?(ay/2):ay)*mbw+(luma?(ax/2):ax);
+        const int b=(luma?(by/2):by)*mbw+(luma?(bx/2):bx);
+        return a>=0 && b>=0 && a<static_cast<int>(flags.size()) &&
+               b<static_cast<int>(flags.size()) && flags[static_cast<size_t>(a)] &&
+               flags[static_cast<size_t>(b)];
+    };
+    auto plane=[&](const std::vector<uint8_t>& in,std::vector<uint8_t>& dst,
+                   int sw,int sh,int dw,int dh,int vw,int vh,int edge_x,int edge_y,
+                   bool luma) {
+        for(int y=0;y<sh;++y)
+            std::copy_n(in.data()+static_cast<size_t>(y)*sw,sw,
+                        dst.data()+static_cast<size_t>(y)*dw);
+        for(int y=0;y<dh;++y) for(int x=0;x<dw;++x) {
+            if (x<vw && y<vh) continue;
+            const bool right=x>=vw && edge_x>=0 &&
+                active(luma,edge_x/8-1,y/8,edge_x/8,y/8);
+            const bool bottom=y>=vh && edge_y>=0 &&
+                active(luma,x/8,edge_y/8-1,x/8,edge_y/8);
+            if (!right && !bottom) continue;
+            const int sx=std::clamp(x,0,vw-1),sy=std::clamp(y,0,vh-1);
+            dst[static_cast<size_t>(y)*dw+x]=in[static_cast<size_t>(sy)*sw+sx];
+        }
+    };
+    plane(src.y,out.y,src.width,src.height,cw,ch,visible_w,visible_h,vx,vy,true);
+    plane(src.u,out.u,src.width/2,src.height/2,ccw,cch,cvw,cvh,cx,cy,false);
+    plane(src.v,out.v,src.width/2,src.height/2,ccw,cch,cvw,cvh,cx,cy,false);
+    return out;
+}
+
 using MotionVector = Vc1Encoder::MotionVector;
 using ProgressiveMvMode = Vc1Encoder::ProgressiveMvMode;
 using IntensityComp = Vc1Encoder::IntensityComp;
@@ -179,6 +240,10 @@ std::vector<uint8_t> Vc1Encoder::encode_i_picture(const Frame& f, IEncodeStats* 
         auto mb_mquant=[&](size_t pos) { return dquant_plan.mquant.empty()?c_.pqindex:dquant_plan.mquant[pos]; };
         auto mb_derived=[&](size_t pos) { return dquant_mb_derived(dquant_plan,pos,mbw); };
         const OverlapPlan overlap_plan=choose_i_overlap_plan(f);
+        const Frame edge_source = overlap_plan.mode==OverlapMode::None ? Frame{} :
+            make_overlap_edge_source(f,c_.visible_width(),c_.visible_height(),
+                                     overlap_plan.flags,overlap_plan.mode==OverlapMode::All);
+        const Frame& intra_source=edge_source.width?edge_source:f;
         if (stats) {
             for (size_t pos=0;pos<mbs;++pos)
                 record_mquant(*stats,c_.pqindex,mb_mquant(pos));
@@ -195,16 +260,16 @@ std::vector<uint8_t> Vc1Encoder::encode_i_picture(const Frame& f, IEncodeStats* 
                         const std::vector<uint8_t>* plane=nullptr;
                         int width=0,height=0,bx=0,by=0;
                         if (k < 4) {
-                            plane=&f.y; width=c_.width; height=c_.height;
+                            plane=&intra_source.y; width=intra_source.width; height=intra_source.height;
                             bx=mx*2+(k&1); by=my*2+((k>>1)&1);
                         } else {
-                            plane=(k==4)?&f.u:&f.v; width=c_.width/2; height=c_.height/2;
+                            plane=(k==4)?&intra_source.u:&intra_source.v; width=intra_source.width/2; height=intra_source.height/2;
                             bx=mx; by=my;
                         }
                         const size_t pos=static_cast<size_t>(my)*mbw+mx;
                         qblocks[block_index(mbw,mx,my,k)] =
                             quantize_ac(*plane,width,height,bx*8,by*8,k>=4,base_intra_scan,
-                                        mb_mquant(pos),mb_derived(pos),k>=4?&f.y:nullptr);
+                                        mb_mquant(pos),mb_derived(pos),k>=4?&intra_source.y:nullptr);
                     }
                 }
             }
@@ -244,11 +309,11 @@ std::vector<uint8_t> Vc1Encoder::encode_i_picture(const Frame& f, IEncodeStats* 
                     std::vector<int>* dcg=nullptr;
                     std::vector<int>* qg=nullptr;
                     if (k<4) {
-                        plane=&f.y; width=c_.width; height=c_.height;
+                        plane=&intra_source.y; width=intra_source.width; height=intra_source.height;
                         bx=mx*2+(k&1); by=my*2+((k>>1)&1);
                         dcg=&t_ydc; qg=&t_yq; gw=ybw;
                     } else {
-                        plane=(k==4)?&f.u:&f.v; width=c_.width/2; height=c_.height/2;
+                        plane=(k==4)?&intra_source.u:&intra_source.v; width=intra_source.width/2; height=intra_source.height/2;
                         bx=mx; by=my; dcg=(k==4)?&t_udc:&t_vdc;
                         qg=(k==4)?&t_uq:&t_vq; gw=cbw;
                     }
@@ -410,8 +475,8 @@ std::vector<uint8_t> Vc1Encoder::encode_i_picture(const Frame& f, IEncodeStats* 
         std::vector<int> s_vq(static_cast<size_t>(cbw)*cbh,0);
         for (int my=0;my<mbh;++my) for (int mx=0;mx<mbw;++mx) for (int k=0;k<6;++k) {
             const std::vector<uint8_t>* plane=nullptr; int width=0,height=0,bx=0,by=0;
-            if (k<4) { plane=&f.y; width=c_.width; height=c_.height; bx=mx*2+(k&1); by=my*2+((k>>1)&1); }
-            else { plane=(k==4)?&f.u:&f.v; width=c_.width/2; height=c_.height/2; bx=mx; by=my; }
+            if (k<4) { plane=&intra_source.y; width=intra_source.width; height=intra_source.height; bx=mx*2+(k&1); by=my*2+((k>>1)&1); }
+            else { plane=(k==4)?&intra_source.u:&intra_source.v; width=intra_source.width/2; height=intra_source.height/2; bx=mx; by=my; }
             std::vector<int>* grid=nullptr; std::vector<int>* qgrid=nullptr; int gw=0;
             if (k<4) { grid=&s_ydc; qgrid=&s_yq; gw=ybw; }
             else if (k==4) { grid=&s_udc; qgrid=&s_uq; gw=cbw; }
@@ -523,15 +588,15 @@ std::vector<uint8_t> Vc1Encoder::encode_i_picture(const Frame& f, IEncodeStats* 
                     if (k < 4) {
                         bc.bx = mx*2 + (k&1);
                         bc.by = my*2 + ((k>>1)&1);
-                        bc.width = c_.width;
-                        bc.height = c_.height;
-                        bc.plane = &f.y;
+                        bc.width = intra_source.width;
+                        bc.height = intra_source.height;
+                        bc.plane = &intra_source.y;
                     } else {
                         bc.bx = mx;
                         bc.by = my;
-                        bc.width = c_.width/2;
-                        bc.height = c_.height/2;
-                        bc.plane = (k==4) ? &f.u : &f.v;
+                        bc.width = intra_source.width/2;
+                        bc.height = intra_source.height/2;
+                        bc.plane = (k==4) ? &intra_source.u : &intra_source.v;
                     }
                     if (c_.ac_coding)
                         bc.qac = qblocks[block_index(mbw,mx,my,k)];
@@ -746,10 +811,14 @@ std::vector<uint8_t> Vc1Encoder::encode_i_picture(const Frame& f, IEncodeStats* 
         return c_.syntax == StreamSyntax::Wmv9Main ? b.finish_raw() : bdu(0x0d,b.finish_rbdu());
     }
 
-Vc1Encoder::SignedFrame Vc1Encoder::reconstruct_i_signed_padded(const Frame& f) const {
+Vc1Encoder::SignedFrame Vc1Encoder::reconstruct_i_signed_padded(const Frame& f,const OverlapPlan* plan) const {
         if (f.width != c_.width || f.height != c_.height)
             throw std::runtime_error("I-picture dimensions do not match encoder configuration");
         const int mbw=(c_.width+15)/16, mbh=(c_.height+15)/16;
+        const Frame edge_source=plan && plan->mode!=OverlapMode::None ?
+            make_overlap_edge_source(f,c_.visible_width(),c_.visible_height(),
+                                     plan->flags,plan->mode==OverlapMode::All):Frame{};
+        const Frame& intra_source=edge_source.width?edge_source:f;
         const int ybw=mbw*2, ybh=mbh*2;
         const int cbw=mbw, cbh=mbh;
         const size_t mbs=static_cast<size_t>(mbw)*mbh;
@@ -778,19 +847,19 @@ Vc1Encoder::SignedFrame Vc1Encoder::reconstruct_i_signed_padded(const Frame& f) 
                     std::vector<int>* dst=nullptr;
                     int sw=0,sh=0,dw=0,bx=0,by=0;
                     if (k<4) {
-                        src=&f.y; dst=&signed_frame.y;
-                        sw=c_.width; sh=c_.height; dw=signed_frame.width;
+                        src=&intra_source.y; dst=&signed_frame.y;
+                        sw=intra_source.width; sh=intra_source.height; dw=signed_frame.width;
                         bx=mx*2+(k&1); by=my*2+((k>>1)&1);
                     } else {
-                        src=(k==4)?&f.u:&f.v; dst=(k==4)?&signed_frame.u:&signed_frame.v;
-                        sw=c_.width/2; sh=c_.height/2; dw=signed_frame.width/2;
+                        src=(k==4)?&intra_source.u:&intra_source.v; dst=(k==4)?&signed_frame.u:&signed_frame.v;
+                        sw=intra_source.width/2; sh=intra_source.height/2; dw=signed_frame.width/2;
                         bx=mx; by=my;
                     }
                     const size_t mbpos=static_cast<size_t>(my)*mbw+mx;
                     const int mq=dquant_plan.mquant.empty()?c_.pqindex:dquant_plan.mquant[mbpos];
                     const bool derived=dquant_mb_derived(dquant_plan,mbpos,mbw);
                     std::array<int,64> q{};
-                    if (c_.ac_coding) q=quantize_ac(*src,sw,sh,bx*8,by*8,k>=4,base_intra_scan,mq,derived,k>=4?&f.y:nullptr);
+                    if (c_.ac_coding) q=quantize_ac(*src,sw,sh,bx*8,by*8,k>=4,base_intra_scan,mq,derived,k>=4?&intra_source.y:nullptr);
                     std::vector<int>* dcg=nullptr; std::vector<int>* qg=nullptr; int gw=0;
                     if (k<4) { dcg=&ydc; qg=&yq; gw=ybw; }
                     else if (k==4) { dcg=&udc; qg=&uq; gw=cbw; }
@@ -817,8 +886,8 @@ Vc1Encoder::SignedFrame Vc1Encoder::reconstruct_i_signed_padded(const Frame& f) 
     }
 
 Frame Vc1Encoder::reconstruct_i_picture_padded(const Frame& f) const {
-        SignedFrame signed_frame=reconstruct_i_signed_padded(f);
         const OverlapPlan plan=choose_i_overlap_plan(f);
+        SignedFrame signed_frame=reconstruct_i_signed_padded(f,&plan);
         apply_i_overlap(signed_frame,plan);
         const int mbw=(c_.width+15)/16, mbh=(c_.height+15)/16;
         Frame padded=empty_padded_frame(mbw,mbh);
@@ -892,6 +961,9 @@ PEncodeResult Vc1Encoder::encode_p_picture(const Frame& f, const Frame& ref, con
         out.frame_transform_exact_checked=transform_plan.exact_checked;
         out.reconstructed=empty_frame();
         Frame loop_reconstructed=empty_padded_frame(mbw,mbh);
+        const Frame edge_source=(c_.overlap && c_.pqindex>=9) ?
+            make_overlap_edge_source(f,c_.visible_width(),c_.visible_height(),a.use_intra,false):Frame{};
+        const Frame& intra_source=edge_source.width?edge_source:f;
         SignedFrame p_intra_signed;
         p_intra_signed.width=loop_reconstructed.width; p_intra_signed.height=loop_reconstructed.height;
         p_intra_signed.y.assign(loop_reconstructed.y.size(),0);
@@ -959,18 +1031,18 @@ PEncodeResult Vc1Encoder::encode_p_picture(const Frame& f, const Frame& ref, con
                         std::vector<int>* qg=nullptr;
                         int gw=0;
                         if (k<4) {
-                            bc.plane=&f.y; bc.width=c_.width; bc.height=c_.height;
+                            bc.plane=&intra_source.y; bc.width=intra_source.width; bc.height=intra_source.height;
                             bc.bx=mx*2+(k&1); bc.by=my*2+((k>>1)&1);
                             dcg=&p_ydc; ing=&p_yintra; acg=&p_yac; qg=&p_yq; gw=ybw;
                         } else {
-                            bc.plane=(k==4)?&f.u:&f.v; bc.width=c_.width/2; bc.height=c_.height/2;
+                            bc.plane=(k==4)?&intra_source.u:&intra_source.v; bc.width=intra_source.width/2; bc.height=intra_source.height/2;
                             bc.bx=mx; bc.by=my; dcg=(k==4)?&p_udc:&p_vdc;
                             ing=(k==4)?&p_uintra:&p_vintra; acg=(k==4)?&p_uac:&p_vac; qg=(k==4)?&p_uq:&p_vq; gw=mbw;
                         }
                         const bool mq_derived=ms.mquant!=c_.pqindex;
                         const int qstate=mq_derived?-ms.mquant:ms.mquant;
                         if (c_.ac_coding)
-                            bc.qac=quantize_ac(*bc.plane,bc.width,bc.height,bc.bx*8,bc.by*8,k>=4,kInterScan.data(),ms.mquant,mq_derived,k>=4?&f.y:nullptr);
+                            bc.qac=quantize_ac(*bc.plane,bc.width,bc.height,bc.bx*8,bc.by*8,k>=4,kInterScan.data(),ms.mquant,mq_derived,k>=4?&intra_source.y:nullptr);
                         bc.dc_target=choose_inter_intra_dc_for_mean(padded_block_mean(*bc.plane,bc.width,bc.height,bc.bx*8,bc.by*8,k>=4?128:0),ms.mquant);
                         const size_t gi=static_cast<size_t>(bc.by)*gw+bc.bx;
                         const bool a_avail=bc.by>0 && (*ing)[gi-static_cast<size_t>(gw)]!=0;

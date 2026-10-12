@@ -20,11 +20,11 @@
 extern "C" {
 #endif
 
-#define LIBVC1_API_VERSION 41
+#define LIBVC1_API_VERSION 48
 #define LIBVC1_VERSION_MAJOR 0
 #define LIBVC1_VERSION_MINOR 2
-#define LIBVC1_VERSION_PATCH 48
-#define LIBVC1_VERSION_STRING "0.2.48"
+#define LIBVC1_VERSION_PATCH 69
+#define LIBVC1_VERSION_STRING "0.2.69"
 
 typedef struct vc1_t vc1_t;
 
@@ -84,7 +84,10 @@ typedef enum vc1_simd_e {
     VC1_SIMD_K10 = 14,
     VC1_SIMD_BULLDOZER = 15,
     VC1_SIMD_PILEDRIVER = 16,
-    VC1_SIMD_AVX2_PARTIAL = 17
+    VC1_SIMD_AVX2_PARTIAL = 17,
+    VC1_SIMD_AARCH64_NEON = 18,
+    VC1_SIMD_AARCH64_DOTPROD = 19,
+    VC1_SIMD_AARCH64_RDM = 20
 } vc1_simd_e;
 
 /* SIMD primitives independently benchmarked/selected by VC1_SIMD_AUTO. */
@@ -127,7 +130,10 @@ typedef enum vc1_simd_benchmark_tier_e {
     VC1_SIMD_BENCH_BULLDOZER = 10,
     VC1_SIMD_BENCH_PILEDRIVER = 11,
     VC1_SIMD_BENCH_AVX2_PARTIAL = 12,
-    VC1_SIMD_BENCH_TARGET_COUNT = 13,
+    VC1_SIMD_BENCH_AARCH64_NEON = 13,
+    VC1_SIMD_BENCH_AARCH64_DOTPROD = 14,
+    VC1_SIMD_BENCH_AARCH64_RDM = 15,
+    VC1_SIMD_BENCH_TARGET_COUNT = 16,
     VC1_SIMD_BENCH_TIER_COUNT = VC1_SIMD_BENCH_TARGET_COUNT /* compatibility name */
 } vc1_simd_benchmark_tier_e;
 
@@ -247,6 +253,14 @@ typedef enum vc1_long_range_search_mode_e {
     VC1_LONG_RANGE_LEGACY_DISTANT_FIRST = 2
 } vc1_long_range_search_mode_e;
 
+/* API v44: choice of progressive, integer-macroblock local search pattern.
+ * Fractional refinement, ME decision depth and the independent long-range
+ * policy are unaffected. Interlaced field-picture search is unchanged. */
+typedef enum vc1_me_algorithm_e {
+    VC1_ME_ALGORITHM_UMH = 0,
+    VC1_ME_ALGORITHM_DIAMOND = 1
+} vc1_me_algorithm_e;
+
 /* Motion-estimation decision depth. Candidate discovery always uses SAD; the
  * later levels progressively add coded-vector rate, SATD, and codec-aware RD. */
 typedef enum vc1_me_quality_e {
@@ -326,7 +340,7 @@ typedef struct vc1_param_t {
     /* In ABR mode, bias quality toward fuller use of the requested bitrate when headroom is available. */
     int b_rc_maximize;
     /* API v31: relative ABR bitrate weights for intra, P-inter, and B-inter
-     * macroblocks. Defaults are I=5.0, P=1.0, B=0.70. Since 0.2.17 these are
+     * macroblocks. Defaults are I=4.0, P=1.0, B=0.70. Since 0.2.17 these are
      * block-class weights: an intra block inside a P/B picture receives the same
      * relative share as a block in an I picture. The analyzed block mix is
      * normalized over the GOP, so scaling all three by the same factor does not
@@ -402,6 +416,30 @@ typedef struct vc1_param_t {
      * unrestricted and rejects an explicit peak rather than ignoring it. */
     uint64_t i_peak_bitrate;
     void *opaque;
+    /* API v44: append-only to keep all earlier parameter field offsets intact. */
+    vc1_me_algorithm_e i_me_algorithm;
+    /* API v45: 1 evaluates fractional-pixel candidates after integer ME;
+     * 0 keeps integer-pixel vectors without running half/qpel refinement.
+     * This affects encoder search, not the normative VC-1 stream syntax. */
+    int b_subpixel_refinement;
+    /* API v46: use a single residual-guided inter transform instead of
+     * evaluating multiple candidates when DQUANT/trellis are off and no RD
+     * motion or macroblock debug stats need the comparisons. All variable
+     * transform sizes remain available. With fixed 8x8, RD-only estimates
+     * are skipped altogether. Selectable via CLI; used by --fast. */
+    int b_fast_transform_rdo;
+    /* API v47: preserve fractional motion vectors but use an accelerated
+     * adaptive diamond stencil and a shorter SATD candidate list. 0 keeps
+     * the original exhaustive staged subpixel analysis; meaningful only when
+     * b_subpixel_refinement is enabled. Defaults to 0; --fast selects 1. */
+    int b_fast_subpixel_refinement;
+    /* API v48: maximum displacement, in integer pixels, at which fractional
+     * refinement may be attempted. This is a symmetric per-axis bound on the
+     * MV (max(abs(x),abs(y))), not a limit on integer motion search.
+     * 0 disables fractional refinement without restricting integer vectors;
+     * 1024 (default) is unrestricted.
+     * Independent of local-search radius, and applies to distant MVs too. */
+    int i_subpixel_refinement_range;
 } vc1_param_t;
 
 typedef struct vc1_image_t {

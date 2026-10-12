@@ -3,8 +3,35 @@
 
 #include <cmath>
 #include <cstring>
+#if defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
 
 namespace libvc1 {
+
+bool cpu_has_aarch64_neon() {
+#if defined(LIBVC1_HAVE_AARCH64_NEON) && (defined(__aarch64__) || defined(_M_ARM64))
+    return true; // ASIMD/NEON is mandatory in AArch64.
+#else
+    return false;
+#endif
+}
+
+bool cpu_has_aarch64_dotprod() {
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD) && defined(__linux__) && defined(__aarch64__) && defined(HWCAP_ASIMDDP)
+    return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP)!=0;
+#else
+    return false;
+#endif
+}
+bool cpu_has_aarch64_rdm() {
+#if defined(LIBVC1_HAVE_AARCH64_RDM) && defined(__linux__) && defined(__aarch64__) && defined(HWCAP_ASIMDRDM)
+    return (getauxval(AT_HWCAP) & HWCAP_ASIMDRDM)!=0;
+#else
+    return false;
+#endif
+}
 
 bool cpu_has_x86_64_v1() {
 #if defined(LIBVC1_HAVE_X86_64_V1) && (defined(__x86_64__) || defined(__amd64__))
@@ -155,8 +182,8 @@ struct SimdTargetRecord {
 };
 
 /* Registry order is the exact-throughput tie preference order. */
-static const std::array<SimdTargetRecord,12>& simd_target_records() {
-    static const std::array<SimdTargetRecord,12> records{{
+static const std::array<SimdTargetRecord,15>& simd_target_records() {
+    static const std::array<SimdTargetRecord,15> records{{
         {SimdTier::X86V1,       VC1_SIMD_BENCH_X86_64_V1,   "x86-64-v1",   FmaFlavor::None, true, &cpu_has_x86_64_v1},
         {SimdTier::Prescott,    VC1_SIMD_BENCH_PRESCOTT,    "prescott",    FmaFlavor::None, true, &cpu_has_prescott},
         {SimdTier::K10,         VC1_SIMD_BENCH_K10,         "k10",         FmaFlavor::None, true, &cpu_has_k10},
@@ -169,6 +196,21 @@ static const std::array<SimdTargetRecord,12>& simd_target_records() {
         {SimdTier::Avx2Partial, VC1_SIMD_BENCH_AVX2_PARTIAL,"avx2-partial",FmaFlavor::None, true, &cpu_has_avx2_partial},
         {SimdTier::X86V3,       VC1_SIMD_BENCH_X86_64_V3,   "x86-64-v3",   FmaFlavor::Fma3, true, &cpu_has_x86_64_v3},
         {SimdTier::X86V4,       VC1_SIMD_BENCH_X86_64_V4,   "x86-64-v4",   FmaFlavor::Fma3, true, &cpu_has_x86_64_v4},
+        {SimdTier::AArch64Neon, VC1_SIMD_BENCH_AARCH64_NEON, "aarch64-neon", FmaFlavor::None, true, &cpu_has_aarch64_neon},
+        {SimdTier::AArch64Dotprod, VC1_SIMD_BENCH_AARCH64_DOTPROD, "aarch64-dotprod", FmaFlavor::None,
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+            true,
+#else
+            false,
+#endif
+            &cpu_has_aarch64_dotprod},
+        {SimdTier::AArch64Rdm, VC1_SIMD_BENCH_AARCH64_RDM, "aarch64-rdm", FmaFlavor::None,
+#if defined(LIBVC1_HAVE_AARCH64_RDM)
+            true,
+#else
+            false,
+#endif
+            &cpu_has_aarch64_rdm},
     }};
     return records;
 }
@@ -196,6 +238,16 @@ bool simd_target_available(SimdTier tier) {
     if (tier==SimdTier::None) return true;
     const auto* r=simd_target_record(tier);
     return r && r->implemented && r->cpu_available && r->cpu_available();
+}
+
+bool simd_target_supports_primitive(SimdTier tier, SimdPrimitive primitive) {
+    if(tier==SimdTier::AArch64Dotprod)
+        return primitive==SimdPrimitive::LumaQpelSad || primitive==SimdPrimitive::LumaMc ||
+               primitive==SimdPrimitive::LumaMcAvg || primitive==SimdPrimitive::ChromaMc ||
+               primitive==SimdPrimitive::ChromaMcAvg;
+    if(tier==SimdTier::AArch64Rdm)
+        return primitive==SimdPrimitive::IntensityLuma || primitive==SimdPrimitive::IntensityChroma;
+    return true;
 }
 
 bool simd_target_auto_eligible(SimdTier tier,bool benchmark_all) {
@@ -377,6 +429,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
     switch(p){
       case SimdPrimitive::FrameSad:
         if(t==SimdTier::None)sink+=frame_sad_none(x.a.data(),S,x.b.data(),S,S,S,3,-2,2);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)sink+=simd::frame_sad_aarch64_neon(x.a.data(),S,x.b.data(),S,S,S,3,-2,2);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)sink+=simd::frame_sad_x86_64_v1(x.a.data(),S,x.b.data(),S,S,S,3,-2,2);
 #endif
@@ -416,6 +471,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         break;
       case SimdPrimitive::BlockSad:
         if(t==SimdTier::None)sink+=block_sad_none(cp,S,rp,S,32,32,1);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)sink+=simd::block_sad_aarch64_neon(cp,S,rp,S,32,32,1);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)sink+=simd::block_sad_x86_64_v1(cp,S,rp,S,32,32,1);
 #endif
@@ -455,6 +513,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         break;
       case SimdPrimitive::ForwardIntra8:
         if(t==SimdTier::None)forward8_none(cp,nullptr,S,x.co.data(),true);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::forward_transform_intra8_aarch64_neon(cp,S,x.co.data(),fma);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::forward_transform_intra8_x86_64_v1(cp,S,x.co.data(),fma);
 #endif
@@ -494,6 +555,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=static_cast<uint64_t>(std::llabs(static_cast<long long>(x.co[7]))); break;
       case SimdPrimitive::ForwardResidual8:
         if(t==SimdTier::None)forward8_none(cp,rp,S,x.co.data(),false);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::forward_transform_residual8_aarch64_neon(cp,rp,S,x.co.data(),fma);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::forward_transform_residual8_x86_64_v1(cp,rp,S,x.co.data(),fma);
 #endif
@@ -533,6 +597,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=static_cast<uint64_t>(std::llabs(static_cast<long long>(x.co[11]))); break;
       case SimdPrimitive::Inverse8x8:
         std::copy(x.ib.begin(),x.ib.end(),x.io.begin()); if(t==SimdTier::None)inverse8_none(x.io.data());
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::inverse_transform_8x8_aarch64_neon(x.io.data());
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::inverse_transform_8x8_x86_64_v1(x.io.data());
 #endif
@@ -572,6 +639,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=static_cast<uint32_t>(x.io[17]); break;
       case SimdPrimitive::PutBlock8:
         if(t==SimdTier::None)put8_none(dp,S,x.ib.data(),128);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::put_block8_aarch64_neon(dp,S,x.ib.data(),128);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::put_block8_x86_64_v1(dp,S,x.ib.data(),128);
 #endif
@@ -611,6 +681,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=dp[7]; break;
       case SimdPrimitive::AddBlockRect:
         std::memcpy(dp,cp,8); if(t==SimdTier::None)addrect_none(dp,S,x.ib.data(),8,8);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::add_block_rect_aarch64_neon(dp,S,x.ib.data(),8,8);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::add_block_rect_x86_64_v1(dp,S,x.ib.data(),8,8);
 #endif
@@ -650,6 +723,12 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=dp[3]; break;
       case SimdPrimitive::LumaQpelSad:
         if(t==SimdTier::None)sink+=luma_qpel_sad_none(cp,S,rp,S,16,16,1,3,false);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)sink+=simd::block_sad_luma_qpel_aarch64_neon(cp,S,rp,S,16,16,1,3,false);
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+        else if(t==SimdTier::AArch64Dotprod)sink+=simd::block_sad_luma_qpel_aarch64_dotprod(cp,S,rp,S,16,16,1,3,false);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)sink+=simd::block_sad_luma_qpel_x86_64_v1(cp,S,rp,S,16,16,1,3,false);
 #endif
@@ -689,6 +768,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         break;
       case SimdPrimitive::LumaBilinearSad:
         if(t==SimdTier::None)sink+=luma_bilinear_sad_none(cp,S,rp,S,16,16,true,true,false);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)sink+=simd::block_sad_luma_bilinear_aarch64_neon(cp,S,rp,S,16,16,true,true,false);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)sink+=simd::block_sad_luma_bilinear_x86_64_v1(cp,S,rp,S,16,16,true,true,false);
 #endif
@@ -729,6 +811,12 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
       case SimdPrimitive::LumaMc: case SimdPrimitive::LumaMcAvg: {
         const bool avg=p==SimdPrimitive::LumaMcAvg; if(avg)std::memcpy(dp,cp,16);
         if(t==SimdTier::None)luma_mc_none(dp,S,rp,S,16,16,1,3,false,false,avg);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon){if(avg)simd::luma_mc_block_avg_aarch64_neon(dp,S,rp,S,16,16,1,3,false,false);else simd::luma_mc_block_aarch64_neon(dp,S,rp,S,16,16,1,3,false,false);}
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+        else if(t==SimdTier::AArch64Dotprod){if(avg)simd::luma_mc_block_avg_aarch64_dotprod(dp,S,rp,S,16,16,1,3,false,false);else simd::luma_mc_block_aarch64_dotprod(dp,S,rp,S,16,16,1,3,false,false);}
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1){if(avg)simd::luma_mc_block_avg_x86_64_v1(dp,S,rp,S,16,16,1,3,false,false);else simd::luma_mc_block_x86_64_v1(dp,S,rp,S,16,16,1,3,false,false);}
 #endif
@@ -769,6 +857,12 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
       case SimdPrimitive::ChromaMc: case SimdPrimitive::ChromaMcAvg: {
         const bool avg=p==SimdPrimitive::ChromaMcAvg; if(avg)std::memcpy(dp,cp,8);
         if(t==SimdTier::None)chroma_mc_none(dp,S,rp,S,8,8,3,5,false,avg);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon){if(avg)simd::chroma_mc_block_avg_aarch64_neon(dp,S,rp,S,8,8,3,5,false);else simd::chroma_mc_block_aarch64_neon(dp,S,rp,S,8,8,3,5,false);}
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+        else if(t==SimdTier::AArch64Dotprod){if(avg)simd::chroma_mc_block_avg_aarch64_dotprod(dp,S,rp,S,8,8,3,5,false);else simd::chroma_mc_block_aarch64_dotprod(dp,S,rp,S,8,8,3,5,false);}
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1){if(avg)simd::chroma_mc_block_avg_x86_64_v1(dp,S,rp,S,8,8,3,5,false);else simd::chroma_mc_block_x86_64_v1(dp,S,rp,S,8,8,3,5,false);}
 #endif
@@ -808,6 +902,12 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=dp[5]; break; }
       case SimdPrimitive::IntensityLuma:
         if(t==SimdTier::None)intensity_none(x.d.data(),x.a.data(),x.a.size(),71,-3*64);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::intensity_map_plane_aarch64_neon(x.d.data(),x.a.data(),x.a.size(),71,-3*64);
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_RDM)
+        else if(t==SimdTier::AArch64Rdm)simd::intensity_map_plane_aarch64_rdm(x.d.data(),x.a.data(),x.a.size(),71,-3*64);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::intensity_map_plane_x86_64_v1(x.d.data(),x.a.data(),x.a.size(),71,-3*64);
 #endif
@@ -847,6 +947,12 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=x.d[123]; break;
       case SimdPrimitive::IntensityChroma:
         if(t==SimdTier::None)intensity_chroma_none(x.d.data(),x.a.data(),x.a.size(),71);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::intensity_map_chroma_plane_aarch64_neon(x.d.data(),x.a.data(),x.a.size(),71);
+#endif
+#if defined(LIBVC1_HAVE_AARCH64_RDM)
+        else if(t==SimdTier::AArch64Rdm)simd::intensity_map_chroma_plane_aarch64_rdm(x.d.data(),x.a.data(),x.a.size(),71);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::intensity_map_chroma_plane_x86_64_v1(x.d.data(),x.a.data(),x.a.size(),71);
 #endif
@@ -886,6 +992,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=x.d[321]; break;
       case SimdPrimitive::ForwardResidualRect:
         if(t==SimdTier::None)forward_rect_none(cp,rp,S,4,8,x.co.data());
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::forward_transform_residual_rect_aarch64_neon(cp,rp,S,4,8,x.co.data(),fma);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::forward_transform_residual_rect_x86_64_v1(cp,rp,S,4,8,x.co.data(),fma);
 #endif
@@ -925,6 +1034,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=static_cast<uint64_t>(std::llabs(static_cast<long long>(x.co[9]))); break;
       case SimdPrimitive::Quantize:
         if(t==SimdTier::None)quant_none(x.c.data(),x.io.data(),64,18.0,9.0,2047);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::quantize_coefficients_aarch64_neon(x.c.data(),x.io.data(),64,18.0,9.0,2047);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::quantize_coefficients_x86_64_v1(x.c.data(),x.io.data(),64,18.0,9.0,2047);
 #endif
@@ -964,6 +1076,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=static_cast<uint32_t>(x.io[23]); break;
       case SimdPrimitive::PerceptualStats: {
         if(t==SimdTier::None)perceptual_none(cp,rp,S,16,16,&x.stat_sum,&x.stat_grad,&x.stat_residual,&x.stat_min,&x.stat_max,&x.stat_edges,&x.stat_grad_n);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)simd::perceptual_stats_aarch64_neon(cp,rp,S,16,16,&x.stat_sum,&x.stat_grad,&x.stat_residual,&x.stat_min,&x.stat_max,&x.stat_edges,&x.stat_grad_n);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)simd::perceptual_stats_x86_64_v1(cp,rp,S,16,16,&x.stat_sum,&x.stat_grad,&x.stat_residual,&x.stat_min,&x.stat_max,&x.stat_edges,&x.stat_grad_n);
 #endif
@@ -1003,6 +1118,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         sink+=x.stat_sum+x.stat_grad+x.stat_residual+static_cast<unsigned>(x.stat_min+x.stat_max+x.stat_edges+x.stat_grad_n); break;}
       case SimdPrimitive::Satd4x4:
         if(t==SimdTier::None)sink+=satd4x4_none(cp,S,rp,S);
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)sink+=simd::satd4x4_aarch64_neon(cp,S,rp,S);
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)sink+=simd::satd4x4_x86_64_v1(cp,S,rp,S);
 #endif
@@ -1042,6 +1160,9 @@ static void run_primitive(SimdPrimitive p,SimdTier t,bool fma,BenchData& x,uint6
         break;
       case SimdPrimitive::SumU8:
         if(t==SimdTier::None)sink+=sum_none(x.a.data(),x.a.size());
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+        else if(t==SimdTier::AArch64Neon)sink+=simd::sum_u8_aarch64_neon(x.a.data(),x.a.size());
+#endif
 #if defined(LIBVC1_HAVE_X86_64_V1)
         else if(t==SimdTier::X86V1)sink+=simd::sum_u8_x86_64_v1(x.a.data(),x.a.size());
 #endif
@@ -1103,12 +1224,132 @@ static bool compatible(SimdPrimitive p,SimdTier t,bool fma) {
     }
 }
 
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+// Representative ARM workloads: the previous benchmark measured only one
+// block size / sample stride / motion fraction per primitive. Mix small and
+// typical picture blocks and fractional-pel modes for both the scalar and
+// NEON candidates. Keep the established x86 workload and its selections
+// unchanged. The wrapper itself is identical for both candidates.
+static void run_arm_workload(SimdPrimitive p,SimdTier t,BenchData& d,uint64_t& sink,unsigned variant){
+    constexpr int S=BenchData::S;
+    const uint8_t* cur=d.a.data()+2*S+2;
+    const uint8_t* ref=d.b.data()+2*S+2;
+    uint8_t* dst=d.d.data()+2*S+2;
+    const bool neon=t!=SimdTier::None;
+    const int w[4]={8,16,32,32};
+    const int h[4]={8,16,32,32};
+    const int hm[4]={0,1,0,1};
+    const int vm[4]={0,0,2,3};
+    const int fx[4]={0,3,0,3};
+    const int fy[4]={0,0,5,5};
+    const int v=int(variant&3);
+    switch(p){
+      case SimdPrimitive::FrameSad: {
+        const int sizes[4]={16,32,64,64}, ss[4]={1,1,2,4};
+        const int n=sizes[v];
+        sink+=neon?simd::frame_sad_aarch64_neon(d.a.data(),S,d.b.data(),S,n,n,3,-2,ss[v]):
+                   frame_sad_none(d.a.data(),S,d.b.data(),S,n,n,3,-2,ss[v]);
+        break;
+      }
+      case SimdPrimitive::BlockSad: {
+        const int ss[4]={1,1,1,2};
+        sink+=neon?simd::block_sad_aarch64_neon(cur,S,ref,S,w[v],h[v],ss[v]):
+                   block_sad_none(cur,S,ref,S,w[v],h[v],ss[v]);
+        break;
+      }
+      case SimdPrimitive::AddBlockRect: {
+        const int rw[4]={4,8,4,8},rh[4]={4,4,8,8};
+        if(neon)simd::add_block_rect_aarch64_neon(dst,S,d.ib.data(),rw[v],rh[v]);
+        else addrect_none(dst,S,d.ib.data(),rw[v],rh[v]);
+        sink+=dst[v];break;
+      }
+      case SimdPrimitive::LumaQpelSad: {
+        #if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+        if(t==SimdTier::AArch64Dotprod)sink+=simd::block_sad_luma_qpel_aarch64_dotprod(cur,S,ref,S,w[v],h[v],hm[v],vm[v],false);
+        else
+#endif
+        sink+=neon?simd::block_sad_luma_qpel_aarch64_neon(cur,S,ref,S,w[v],h[v],hm[v],vm[v],false):
+                   luma_qpel_sad_none(cur,S,ref,S,w[v],h[v],hm[v],vm[v],false);
+        break;
+      }
+      case SimdPrimitive::LumaBilinearSad: {
+        sink+=neon?simd::block_sad_luma_bilinear_aarch64_neon(cur,S,ref,S,w[v],h[v],hm[v]!=0,vm[v]!=0,false):
+                   luma_bilinear_sad_none(cur,S,ref,S,w[v],h[v],hm[v]!=0,vm[v]!=0,false);
+        break;
+      }
+      case SimdPrimitive::LumaMc: case SimdPrimitive::LumaMcAvg: {
+        const bool avg=p==SimdPrimitive::LumaMcAvg;
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+        if(t==SimdTier::AArch64Dotprod){
+            if(avg)simd::luma_mc_block_avg_aarch64_dotprod(dst,S,ref,S,w[v],h[v],hm[v],vm[v],false,false);
+            else simd::luma_mc_block_aarch64_dotprod(dst,S,ref,S,w[v],h[v],hm[v],vm[v],false,false);
+        }else
+#endif
+        if(neon){
+            if(avg)simd::luma_mc_block_avg_aarch64_neon(dst,S,ref,S,w[v],h[v],hm[v],vm[v],false,false);
+            else simd::luma_mc_block_aarch64_neon(dst,S,ref,S,w[v],h[v],hm[v],vm[v],false,false);
+        }else luma_mc_none(dst,S,ref,S,w[v],h[v],hm[v],vm[v],false,false,avg);
+        sink+=dst[v];break;
+      }
+      case SimdPrimitive::ChromaMc: case SimdPrimitive::ChromaMcAvg: {
+        const bool avg=p==SimdPrimitive::ChromaMcAvg;
+#if defined(LIBVC1_HAVE_AARCH64_DOTPROD)
+        if(t==SimdTier::AArch64Dotprod){
+            if(avg)simd::chroma_mc_block_avg_aarch64_dotprod(dst,S,ref,S,w[v],h[v],fx[v],fy[v],false);
+            else simd::chroma_mc_block_aarch64_dotprod(dst,S,ref,S,w[v],h[v],fx[v],fy[v],false);
+        }else
+#endif
+        if(neon){
+            if(avg)simd::chroma_mc_block_avg_aarch64_neon(dst,S,ref,S,w[v],h[v],fx[v],fy[v],false);
+            else simd::chroma_mc_block_aarch64_neon(dst,S,ref,S,w[v],h[v],fx[v],fy[v],false);
+        }else chroma_mc_none(dst,S,ref,S,w[v],h[v],fx[v],fy[v],false,avg);
+        sink+=dst[v];break;
+      }
+      case SimdPrimitive::IntensityLuma: case SimdPrimitive::IntensityChroma: {
+        const size_t count[4]={64,256,1024,4096};
+        const size_t n=count[v];
+        const bool chroma=p==SimdPrimitive::IntensityChroma;
+#if defined(LIBVC1_HAVE_AARCH64_RDM)
+        if(t==SimdTier::AArch64Rdm){
+            if(chroma)simd::intensity_map_chroma_plane_aarch64_rdm(d.d.data(),d.a.data(),n,71);
+            else simd::intensity_map_plane_aarch64_rdm(d.d.data(),d.a.data(),n,71,-3*64);
+        }else
+#endif
+        if(neon){
+            if(chroma)simd::intensity_map_chroma_plane_aarch64_neon(d.d.data(),d.a.data(),n,71);
+            else simd::intensity_map_plane_aarch64_neon(d.d.data(),d.a.data(),n,71,-3*64);
+        }else if(chroma)intensity_chroma_none(d.d.data(),d.a.data(),n,71);
+        else intensity_none(d.d.data(),d.a.data(),n,71,-3*64);
+        sink+=d.d[v];break;
+      }
+      case SimdPrimitive::SumU8: {
+        const size_t count[4]={16,64,256,4096};
+        sink+=neon?simd::sum_u8_aarch64_neon(d.a.data(),count[v]):sum_none(d.a.data(),count[v]);
+        break;
+      }
+      default: run_primitive(p,t,false,d,sink);break;
+    }
+}
+#endif
+
+static void benchmark_run(SimdPrimitive p,SimdTier t,bool fma,BenchData& d,uint64_t& sink,unsigned variant){
+#if defined(LIBVC1_HAVE_AARCH64_NEON)
+    if(t==SimdTier::None || t==SimdTier::AArch64Neon || t==SimdTier::AArch64Dotprod || t==SimdTier::AArch64Rdm){
+        run_arm_workload(p,t,d,sink,variant);
+        return;
+    }
+#else
+    (void)variant;
+#endif
+    run_primitive(p,t,fma,d,sink);
+}
+
 static double benchmark_one(SimdPrimitive p,SimdTier t,bool fma,int ms) {
     BenchData d; uint64_t sink=0,iterations=0;
-    for(int i=0;i<8;++i) run_primitive(p,t,fma,d,sink);
+    for(int i=0;i<8;++i) benchmark_run(p,t,fma,d,sink,static_cast<unsigned>(i));
     const auto start=std::chrono::steady_clock::now();
     const auto deadline=start+std::chrono::milliseconds(ms);
-    do { for(int k=0;k<8;++k)run_primitive(p,t,fma,d,sink); iterations+=8; } while(std::chrono::steady_clock::now()<deadline);
+    do { for(int k=0;k<8;++k)benchmark_run(p,t,fma,d,sink,static_cast<unsigned>(iterations+static_cast<uint64_t>(k))); iterations+=8; } while(std::chrono::steady_clock::now()<deadline);
     static volatile uint64_t keep=0; keep^=sink;
     const double sec=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     return sec>0.0?static_cast<double>(iterations)/sec:0.0;
@@ -1146,6 +1387,7 @@ SimdBenchmarkResult auto_select_simd(bool allow_fma,bool benchmark_all) {
         if(none_rate>0){logsum[VC1_SIMD_BENCH_NONE]+=std::log(none_rate);++nrate[VC1_SIMD_BENCH_NONE];}
         for (const auto& target : simd_target_records()) {
             if (!simd_target_auto_eligible(target.tier,benchmark_all)) continue;
+            if (!simd_target_supports_primitive(target.tier,p)) continue;
             if(!compatible(p,target.tier,false)) continue;
             double r=benchmark_one(p,target.tier,false,slice);
             bool chosen_fma=false;
