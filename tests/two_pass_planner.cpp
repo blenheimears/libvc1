@@ -56,22 +56,39 @@ int main() {
             check(std::abs(total-16.0)<1e-8,"whole-video GOP budget not conserved");
         }
         {
-            // The size ledger never caps an individual GOP: if an early GOP
-            // costs twice its planned share, *all* future unscheduled GOPs
-            // repay the difference without charging just the next GOP.
+            // Pass 2 must honor the complete pass-file plan at every point.
+            // Early overshoot is diagnostic only: it must never starve later
+            // GOPs or a short partial GOP at end of stream.
             vc1_twopass::BudgetLedger ledger(baseline,24000,24,1);
             check(std::abs(ledger.target_bits-16000.0)<1e-9,"whole-video target");
-            const double first=ledger.launch(0);
-            check(std::abs(first-1.0)<1e-9,"initial budget multiplier");
+            check(std::abs(ledger.launch(0)-1.0)<1e-9,"initial budget multiplier");
             ledger.commit(0,8000.0);
-            check(std::abs(ledger.launch(1)-2.0/3.0)<1e-9,"size error was not spread over future GOPs");
+            check(std::abs(ledger.launch(1)-1.0)<1e-9,"early overshoot changed globally planned GOP budget");
             ledger.commit(1,2000.0);
-            check(std::abs(ledger.launch(2)-0.75)<1e-9,"remaining budget reconciliation");
-            check(std::abs(ledger.launch(3)-0.75)<1e-9,"concurrent GOP reservations double spent budget");
+            check(std::abs(ledger.launch(2)-1.0)<1e-9,"middle GOP changed whole-file plan");
+            check(std::abs(ledger.launch(3)-1.0)<1e-9,"tail GOP was starved by prior actual size");
             ledger.commit(2,3000.0);
             ledger.commit(3,3000.0);
-            check(std::abs(ledger.actual_bits-ledger.target_bits)<1e-9,"final size reconciliation");
+            check(std::abs(ledger.actual_bits-16000.0)<1e-9,"actual accounting");
             check(std::abs(ledger.deviation_percent())<1e-9,"final size error");
+        }
+        {
+            // Reproduce the shape that exposed the Big Buck Bunny tail bug:
+            // several full GOPs followed by a short partial GOP. Even after a
+            // large early overshoot, the final partial GOP keeps its pass-file
+            // target rather than inheriting the remaining-budget error.
+            vc1_twopass::Plan partial;
+            partial.by_display.resize(10);
+            partial.gops={
+                vc1_twopass::GopPlan{0,4,1.0,1.0},
+                vc1_twopass::GopPlan{4,4,1.0,1.0},
+                vc1_twopass::GopPlan{8,2,1.0,1.0}};
+            vc1_twopass::BudgetLedger ledger(partial,24000,24,1);
+            check(std::abs(ledger.launch(0)-1.0)<1e-9,"partial-tail initial scale");
+            ledger.commit(0,12000.0);
+            check(std::abs(ledger.launch(1)-1.0)<1e-9,"partial-tail middle scale changed");
+            ledger.commit(1,4000.0);
+            check(std::abs(ledger.launch(2)-1.0)<1e-9,"partial final GOP was starved");
         }
         write(2,4,1);
         {

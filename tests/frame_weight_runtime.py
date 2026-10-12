@@ -125,10 +125,10 @@ with tempfile.TemporaryDirectory(prefix='libvc1-block-weights-') as d:
     # collapses exactly to the old picture-class weight law.
     pure=td/'pure.y4m'; write_y4m(pure,pure_frames())
     default_bs,default_rows,_,default_log=run(td,pure,'pure-default',disable_pb=True)
-    doubled_bs,doubled_rows,_,_=run(td,pure,'pure-doubled',weights=(10.0,2.0,1.4),disable_pb=True)
+    doubled_bs,doubled_rows,_,_=run(td,pure,'pure-doubled',weights=(8.0,2.0,1.4),disable_pb=True)
     custom_bs,custom_rows,_,custom_log=run(td,pure,'pure-custom',weights=(5.0,2.0,0.5),disable_pb=True)
     dp=plans(default_rows); xp=plans(doubled_rows); cp=plans(custom_rows)
-    if not close(dp['I']/dp['P'],5.0) or not close(dp['B']/dp['P'],0.70):
+    if not close(dp['I']/dp['P'],4.0) or not close(dp['B']/dp['P'],0.70):
         raise SystemExit(f'pure default planned-bit ratios wrong: {dp}')
     if not close(cp['I']/cp['P'],2.5) or not close(cp['B']/cp['P'],0.25):
         raise SystemExit(f'pure custom planned-bit ratios wrong: {cp}')
@@ -166,7 +166,7 @@ with tempfile.TemporaryDirectory(prefix='libvc1-block-weights-') as d:
                         bitrate='100k',buffer='500k')
     _,bbase_rows,_,_=run(td,bsrc,'mixed-b-no-intra',bframes=1,search=0,disable_b=True,
                          bitrate='100k',buffer='500k')
-    bscaled_bs,bscaled_rows,bscaled_mb,_=run(td,bsrc,'mixed-b-doubled',weights=(10.0,2.0,1.4),
+    bscaled_bs,bscaled_rows,bscaled_mb,_=run(td,bsrc,'mixed-b-doubled',weights=(8.0,2.0,1.4),
                                              bframes=1,search=0,mbstats=True,
                                              bitrate='100k',buffer='500k')
     br=frame(brows,'B'); bbase=frame(bbase_rows,'B')
@@ -189,7 +189,7 @@ with tempfile.TemporaryDirectory(prefix='libvc1-block-weights-') as d:
     # legacy frame-named switches remain accepted aliases, but the help-facing
     # controls are block weights.
     norm_log=default_log.replace('0.70','0.7')
-    if 'weights=I:5/P:1/B:0.7' not in norm_log:
+    if 'weights=I:4/P:1/B:0.7' not in norm_log:
         raise SystemExit('startup options did not report default I/P/B block weights')
     if 'rate-mode=abr, target=' not in norm_log:
         raise SystemExit('startup options did not report ABR ceiling')

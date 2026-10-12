@@ -37,7 +37,7 @@ for t in range(N):
     video += bytes((90 + x * 3 + t * 2) % 256 for y in range(H // 2) for x in range(W // 2))
     video += bytes((130 + y * 5 + t * 3) % 256 for y in range(H // 2) for x in range(W // 2))
 common = ['-i', '-', '--bitrate', '450k', '--buffer-size', '800k', '--keyint', '6',
-          '--threads', '1', '--fastest', '--no-scene-cut', '--simd', 'none']
+          '--threads', '1', '--no-trellis', '--no-aq', '--no-dquant', '--no-fade-comp', '--fixed-8x8', '--search-range', '0', '--local-search-range', '0', '--no-scene-cut', '--simd', 'none']
 
 with tempfile.TemporaryDirectory(prefix='libvc1-format-only-') as directory:
     root = Path(directory)

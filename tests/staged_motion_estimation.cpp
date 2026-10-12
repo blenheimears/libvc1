@@ -63,6 +63,61 @@ int main() {
     }
 
 
+    // API v48: the bound is absolute MV displacement, not the local search
+    // radius. A 9-pixel seed with a limit of 8 must return an INTEGER vector,
+    // but retain its long-range displacement and compute the correct SAD.
+    {
+        EncoderConfig limcfg=cfg;
+        limcfg.width=96; limcfg.height=64;
+        limcfg.display_width=96; limcfg.display_height=64;
+        limcfg.motion_search_range=64;
+        limcfg.motion_local_search_range=4;
+        limcfg.subpixel_refinement_range=8;
+        limcfg.me_quality=VC1_ME_SATD;
+        Vc1Encoder limited(limcfg);
+        Frame large; large.width=96; large.height=64;
+        large.y.resize(96*64);
+        large.u.assign(48*32,128);large.v=large.u;
+        for (int y=0;y<64;++y) for (int x=0;x<96;++x)
+            large.y[static_cast<size_t>(y)*96+x]=static_cast<uint8_t>((x*13+y*7+(x*y)%39)&255);
+        uint64_t far_cost=0;
+        const Vc1Encoder::MotionVector far_seed{36,0};
+        auto far=limited.refine_motion_block_staged(large,large,32,16,16,16,
+            far_seed,64,Vc1Encoder::ProgressiveMvMode::OneMvQpel,pi,true,nullptr,&far_cost);
+        if (far.xq!=36 || far.yq!=0 ||
+            far_cost!=limited.block_sad_motion(large,large,32,16,16,16,far,Vc1Encoder::ProgressiveMvMode::OneMvQpel)) {
+            std::fprintf(stderr,"subpixel limit altered extended integer search or SAD\n"); return 40;
+        }
+        uint64_t near_cost=0;
+        const auto near=limited.refine_motion_block_staged(large,large,32,16,16,16,
+            Vc1Encoder::MotionVector{32,0},64,Vc1Encoder::ProgressiveMvMode::OneMvQpel,
+            pi,true,nullptr,&near_cost);
+        if (std::max(std::abs(near.xq),std::abs(near.yq))>32) {
+            std::fprintf(stderr,"fractional stencil crossed displacement cutoff\n"); return 41;
+        }
+        limcfg.subpixel_refinement_range=0;
+        Vc1Encoder zero_limit(limcfg);
+        uint64_t zero_cost=0;
+        const auto only_zero=zero_limit.refine_motion_block_staged(large,large,32,16,16,16,
+            Vc1Encoder::MotionVector{1,0},64,Vc1Encoder::ProgressiveMvMode::OneMvQpel,
+            pi,true,nullptr,&zero_cost);
+        if (only_zero.xq || only_zero.yq ||
+            zero_cost!=zero_limit.block_sad_motion(large,large,32,16,16,16,only_zero,Vc1Encoder::ProgressiveMvMode::OneMvQpel)) {
+            std::fprintf(stderr,"zero cutoff still performed fractional refinement\n"); return 42;
+        }
+        // SAD-only direct and staged paths obey the same cutoff.
+        limcfg.subpixel_refinement_range=8;
+        limcfg.me_quality=VC1_ME_SAD;
+        Vc1Encoder sad_limit(limcfg);
+        const auto direct=sad_limit.refine_motion_block(large,large,32,16,16,16,
+            far_seed,64,Vc1Encoder::ProgressiveMvMode::OneMvQpel);
+        const auto staged=sad_limit.refine_motion_block_staged(large,large,32,16,16,16,
+            far_seed,64,Vc1Encoder::ProgressiveMvMode::OneMvQpel,pi,true,nullptr);
+        if (direct.xq!=far.xq || direct.yq!=far.yq || staged.xq!=far.xq || staged.yq!=far.yq) {
+            std::fprintf(stderr,"SAD-only subpixel cutoff differs from staged path\n"); return 43;
+        }
+    }
+
     // The optimized finalist path must be bit-exact with scalar SATD.  Exercise
     // real fractional interpolation too: SIMD mode first renders the luma
     // prediction through the selected MC kernel and then uses the SSE2 4x4

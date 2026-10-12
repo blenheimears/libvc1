@@ -34,4 +34,12 @@ file(READ "${SRC}/src/matroska_muxer.cpp" mkv)
 if (NOT mkv MATCHES "LIBVC1_VERSION_STRING")
     message(FATAL_ERROR "Matroska WritingApp metadata must use LIBVC1_VERSION_STRING")
 endif()
+# The C API runtime test previously had stale, hard-coded version expectations.
+# Check those expectations against VERSION at configure/test time as well.
+file(READ "${SRC}/tests/api_c.c" api_c_test)
+string(FIND "${api_c_test}" "LIBVC1_VERSION_PATCH != ${patch}" api_patch_pos)
+string(FIND "${api_c_test}" "strcmp(LIBVC1_VERSION_STRING,\"${version}\")" api_string_pos)
+if (api_patch_pos EQUAL -1 OR api_string_pos EQUAL -1)
+    message(FATAL_ERROR "tests/api_c.c version expectations do not match VERSION=${version}")
+endif()
 message(STATUS "release version metadata is consistent: ${version}")

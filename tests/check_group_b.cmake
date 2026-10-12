@@ -57,12 +57,15 @@ endif()
 
 # 0.1.64 performance regressions: the B-only 1-MV calls must remain ahead of
 # a real allow_4mv gate, qpel refinement must accept a known seed SAD, and B
-# mode RDO must keep the fused four-candidate sampling pass.
+# mode RDO must use block predictions while keeping the fused four-candidate
+# scoring pass. B reference/mode shared computations must remain present.
 foreach(needle
-    "analyze_p_picture_core(f,*past_prediction,mode,false,nullptr)"
-    "analyze_p_picture_core(f,future,mode,false,nullptr)"
+    "analyze_p_picture_core(f,*past_prediction,mode,false,nullptr,forward_reuse)"
+    "analyze_p_picture_core(f,future,mode,false,nullptr,backward_reuse)"
     "known_seed_sad"
-    "six luma interpolation calls/pixel to four"
+    "predict_luma_motion_block(pf_block.data()"
+    "predict_luma_motion_block(pb_block.data()"
+    "b_reuse->long_index"
     "mv decomposition and interpolation mode are constant")
   string(FIND "${C}" "${needle}" p_perf)
   if(p_perf EQUAL -1)

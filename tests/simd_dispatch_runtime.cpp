@@ -20,6 +20,9 @@ static const char* tier_name(SimdTier t) {
         case SimdTier::Bulldozer: return "bulldozer";
         case SimdTier::Piledriver: return "piledriver";
         case SimdTier::Avx2Partial: return "avx2-partial";
+        case SimdTier::AArch64Neon: return "aarch64-neon";
+        case SimdTier::AArch64Dotprod: return "aarch64-dotprod";
+        case SimdTier::AArch64Rdm: return "aarch64-rdm";
     }
     return "invalid";
 }
@@ -29,7 +32,7 @@ static const char* primitive_name(size_t i) {
         "frame-sad","block-sad","forward-intra8","forward-residual8","inverse8x8",
         "put-block8","add-block-rect","luma-qpel-sad","luma-bilinear-sad","luma-mc",
         "luma-mc-avg","chroma-mc","chroma-mc-avg","intensity-luma","intensity-chroma",
-        "forward-residual-rect","quantize","perceptual-stats","sum-u8"
+        "forward-residual-rect","quantize","perceptual-stats","sum-u8","satd4x4"
     };
     return i < sizeof(names)/sizeof(names[0]) ? names[i] : "unknown";
 }
@@ -46,6 +49,21 @@ int main() {
     synthetic[VC1_SIMD_BENCH_X86_64_V3]=148072264.61;
     synthetic[VC1_SIMD_BENCH_X86_64_V4]=148793942.90;
     if (choose_fastest_simd_target(synthetic)!=SimdTier::X86V4) return 20;
+    // No 1% or 2% hysteresis: even a representable ~1e-7% win must win.
+    synthetic[VC1_SIMD_BENCH_X86_64_V4]=
+        synthetic[VC1_SIMD_BENCH_X86_64_V3]+0.01;
+    if (choose_fastest_simd_target(synthetic)!=SimdTier::X86V4) return 92;
+    synthetic.fill(0.0); synthetic[VC1_SIMD_BENCH_NONE]=100.0;
+    synthetic[VC1_SIMD_BENCH_AARCH64_NEON]=200.0;
+    synthetic[VC1_SIMD_BENCH_AARCH64_DOTPROD]=200.000001;
+    if (choose_fastest_simd_target(synthetic)!=SimdTier::AArch64Dotprod) return 93;
+    synthetic[VC1_SIMD_BENCH_AARCH64_DOTPROD]=200.0;
+    if (choose_fastest_simd_target(synthetic)!=SimdTier::AArch64Neon) return 94;
+    synthetic[VC1_SIMD_BENCH_AARCH64_RDM]=200.000001;
+    if (choose_fastest_simd_target(synthetic)!=SimdTier::AArch64Rdm) return 95;
+    // Restore the original v3/v4 synthetic rates for the legacy tie test.
+    synthetic.fill(0.0); synthetic[VC1_SIMD_BENCH_NONE]=72146941.12;
+    synthetic[VC1_SIMD_BENCH_X86_64_V3]=148072264.61;
     /* Exact v3/v4 ties deliberately prefer the earlier registry target (v3). */
     synthetic[VC1_SIMD_BENCH_X86_64_V4]=synthetic[VC1_SIMD_BENCH_X86_64_V3];
     if (choose_fastest_simd_target(synthetic)!=SimdTier::X86V3) return 21;
@@ -54,6 +72,28 @@ int main() {
     synthetic.fill(0.0); synthetic[VC1_SIMD_BENCH_X86_64_V1]=90000000.0; synthetic[VC1_SIMD_BENCH_X86_64_V2]=90000000.0;
     if (choose_fastest_simd_target(synthetic)!=SimdTier::X86V1) return 28;
 
+    const bool neon=simd_target_available(SimdTier::AArch64Neon);
+    if (neon != cpu_has_aarch64_neon()) return 81;
+    if (simd_target_benchmark_slot(SimdTier::AArch64Neon)!=VC1_SIMD_BENCH_AARCH64_NEON) return 82;
+    // The 0.2.51 NEON expansion implements every registered primitive, including
+    // inverse8x8.  The old negative assertion was left over from 0.2.50.
+    for (size_t i=0;i<kSimdPrimitiveCount;++i)
+        if (!simd_target_supports_primitive(SimdTier::AArch64Neon,
+                                            static_cast<SimdPrimitive>(i))) return 83;
+    const struct {SimdTier tier; int slot; bool (*detected)(); int count;} arm_extensions[] = {
+        {SimdTier::AArch64Dotprod,VC1_SIMD_BENCH_AARCH64_DOTPROD,&cpu_has_aarch64_dotprod,5},
+        {SimdTier::AArch64Rdm,VC1_SIMD_BENCH_AARCH64_RDM,&cpu_has_aarch64_rdm,2}
+    };
+    for (const auto& extension:arm_extensions) {
+        if (simd_target_available(extension.tier)!=extension.detected()) return 87;
+        if (simd_target_benchmark_slot(extension.tier)!=extension.slot) return 88;
+        int supported=0;
+        for (size_t i=0;i<kSimdPrimitiveCount;++i)
+            supported+=simd_target_supports_primitive(extension.tier,static_cast<SimdPrimitive>(i));
+        if (supported!=extension.count) return 89;
+    }
+    const bool dotprod=simd_target_available(SimdTier::AArch64Dotprod);
+    const bool rdm=simd_target_available(SimdTier::AArch64Rdm);
     const bool v1=simd_target_available(SimdTier::X86V1);
     const bool prescott=simd_target_available(SimdTier::Prescott);
     const bool k10=simd_target_available(SimdTier::K10);
@@ -86,6 +126,26 @@ int main() {
     const auto r=auto_select_simd(true,false);
     const auto rall=auto_select_simd(true,true);
     if (!(r.scalar_units_per_second>0.0)) return 2;
+    // Verify complete NEON benchmarking on native ARM and prevent cross-ISA
+    // dispatch: x86 and AArch64 kernels must never be probed on the other ISA.
+    for (size_t i=0;i<kSimdPrimitiveCount;++i) {
+        const double automatic=r.primitive_units_per_second[i][VC1_SIMD_BENCH_AARCH64_NEON];
+        const double all=rall.primitive_units_per_second[i][VC1_SIMD_BENCH_AARCH64_NEON];
+        if (neon ? !(automatic>0.0 && all>0.0) : (automatic!=0.0 || all!=0.0)) return 84;
+        for (const auto& extension:arm_extensions) {
+            const bool expected=simd_target_available(extension.tier) &&
+                simd_target_supports_primitive(extension.tier,static_cast<SimdPrimitive>(i));
+            const double automatic_ext=r.primitive_units_per_second[i][extension.slot];
+            const double all_ext=rall.primitive_units_per_second[i][extension.slot];
+            if (expected ? !(automatic_ext>0.0 && all_ext>0.0)
+                         : (automatic_ext!=0.0 || all_ext!=0.0)) return 90;
+        }
+        if (neon) {
+            for (int slot=VC1_SIMD_BENCH_X86_64_V1;slot<=VC1_SIMD_BENCH_X86_64_V4;++slot)
+                if (r.primitive_units_per_second[i][slot]!=0.0 ||
+                    rall.primitive_units_per_second[i][slot]!=0.0) return 85;
+        }
+    }
 
     // The three forward-transform primitives have dedicated v1/v2/v3/v4 kernels.
     // Their benchmark rates must be present whenever the CPU exposes the tier;
@@ -122,6 +182,9 @@ int main() {
     for (size_t i=0;i<kSimdPrimitiveCount;++i) {
         const SimdTier t=r.dispatch.tier[i];
         if (t==SimdTier::Mixed) return 3;
+        if (t==SimdTier::AArch64Neon && !neon) return 86;
+        if (t==SimdTier::AArch64Dotprod && (!dotprod || !simd_target_supports_primitive(t,static_cast<SimdPrimitive>(i)))) return 91;
+        if (t==SimdTier::AArch64Rdm && (!rdm || !simd_target_supports_primitive(t,static_cast<SimdPrimitive>(i)))) return 92;
         if (t==SimdTier::X86V1 && !v1) return 30;
         if ((t==SimdTier::Prescott || t==SimdTier::K10 || t==SimdTier::Conroe || t==SimdTier::Penryn ||
              t==SimdTier::SandyBridge || t==SimdTier::Bulldozer || t==SimdTier::Piledriver ||

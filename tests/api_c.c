@@ -6,11 +6,11 @@
 int main(void) {
     vc1_param_t p;
     if (vc1_param_default(&p) < 0) return 1;
-    if (LIBVC1_API_VERSION < 40 || p.i_scan_mode != VC1_SCAN_PROGRESSIVE || p.b_bluray_compat != 0 || p.i_simd != VC1_SIMD_AUTO || p.b_simd_fma != 1 || p.b_simd_benchmark_all != 1 || VC1_SIMD_SCALAR != VC1_SIMD_NONE || p.b_rc_maximize != 0 || p.f_rc_i_weight != 5.0 || p.f_rc_p_weight != 1.0 || p.f_rc_b_weight != 0.70 || p.f_rc_residual_threshold != 8.0 || p.f_rc_residual_width != 24.0 || p.f_rc_residual_max_q_boost != 0.0 || p.f_inter_intra_threshold != 0.80 || p.i_compute_backend != VC1_COMPUTE_CPU || p.i_compute_device != -1 || p.i_vulkan_min_batch != 8 || p.b_vulkan_force != 0 || p.b_intra_gop_parallelism != 0 || p.b_fixed_gop_grid != 0 || p.b_scene_cut != 1 || p.f_scene_cut_min_interval != 0.25 || p.i_motion_search_range != 1024 || p.i_motion_local_search_range != 32 || p.i_me_quality != VC1_ME_SATD || p.f_distant_match_max_mae != 255.0 || p.b_debug_stats != 0 || p.b_debug_macroblock_stats != 0 || p.b_speed_profile != 0 || p.b_debug_disable_p_intra != 0 || p.b_debug_disable_b_intra != 0 || p.b_dquant != 1 || p.b_skip_identical_frames != 1 || p.i_qp_constant != 2 || p.i_peak_bitrate != 0 || p.i_two_pass != 0 || p.psz_two_pass_stats_file != NULL || p.b_two_pass_dynamic_weights != 1 || p.f_two_pass_dynamic_strength != 1.0) return 8;
-    if (LIBVC1_VERSION_MAJOR != 0 || LIBVC1_VERSION_MINOR != 2 || LIBVC1_VERSION_PATCH != 48 ||
-        strcmp(LIBVC1_VERSION_STRING,"0.2.48") != 0) return 13;
+    if (LIBVC1_API_VERSION < 48 || p.b_fast_transform_rdo != 0 || p.b_fast_subpixel_refinement != 0 || p.i_subpixel_refinement_range != 1024 || p.i_scan_mode != VC1_SCAN_PROGRESSIVE || p.b_bluray_compat != 0 || p.i_simd != VC1_SIMD_AUTO || p.b_simd_fma != 1 || p.b_simd_benchmark_all != 1 || VC1_SIMD_SCALAR != VC1_SIMD_NONE || p.b_rc_maximize != 0 || p.f_rc_i_weight != 4.0 || p.f_rc_p_weight != 1.0 || p.f_rc_b_weight != 0.70 || p.f_rc_residual_threshold != 8.0 || p.f_rc_residual_width != 24.0 || p.f_rc_residual_max_q_boost != 0.0 || p.f_inter_intra_threshold != 0.80 || p.i_compute_backend != VC1_COMPUTE_CPU || p.i_compute_device != -1 || p.i_vulkan_min_batch != 8 || p.b_vulkan_force != 0 || p.b_intra_gop_parallelism != 0 || p.b_fixed_gop_grid != 0 || p.b_scene_cut != 1 || p.f_scene_cut_min_interval != 0.25 || p.i_motion_search_range != 1024 || p.i_motion_local_search_range != 32 || p.i_me_algorithm != VC1_ME_ALGORITHM_UMH || p.b_subpixel_refinement != 1 || p.i_me_quality != VC1_ME_SATD || p.f_distant_match_max_mae != 255.0 || p.b_debug_stats != 0 || p.b_debug_macroblock_stats != 0 || p.b_speed_profile != 0 || p.b_debug_disable_p_intra != 0 || p.b_debug_disable_b_intra != 0 || p.b_dquant != 1 || p.b_skip_identical_frames != 1 || p.i_qp_constant != 2 || p.i_peak_bitrate != 0 || p.i_two_pass != 0 || p.psz_two_pass_stats_file != NULL || p.b_two_pass_dynamic_weights != 1 || p.f_two_pass_dynamic_strength != 1.0) return 8;
+    if (LIBVC1_VERSION_MAJOR != 0 || LIBVC1_VERSION_MINOR != 2 || LIBVC1_VERSION_PATCH != 69 ||
+        strcmp(LIBVC1_VERSION_STRING,"0.2.69") != 0) return 13;
     for (int i=0;i<VC1_SIMD_PRIMITIVE_COUNT;++i) if (p.i_simd_primitive[i] != VC1_SIMD_AUTO) return 14;
-    if (VC1_SIMD_PRIMITIVE_COUNT != 20 || VC1_SIMD_BENCH_TARGET_COUNT != 13 || VC1_SIMD_BENCH_TIER_COUNT != VC1_SIMD_BENCH_TARGET_COUNT || strcmp(vc1_simd_primitive_name(VC1_SIMD_PRIMITIVE_FRAME_SAD),"frame-sad") != 0) return 15;
+    if (VC1_SIMD_PRIMITIVE_COUNT != 20 || VC1_SIMD_BENCH_TARGET_COUNT != 16 || VC1_SIMD_BENCH_TIER_COUNT != VC1_SIMD_BENCH_TARGET_COUNT || strcmp(vc1_simd_primitive_name(VC1_SIMD_PRIMITIVE_FRAME_SAD),"frame-sad") != 0) return 15;
 
     /* API v39 policy: neither the default CPU mode nor legacy AUTO may probe or
        select experimental Vulkan. The force bit is valid only with VULKAN. */
@@ -29,9 +29,17 @@ int main(void) {
     p.i_threads=1; p.i_bframes=0; p.b_intra_only=1; p.b_debug_stats=1; p.b_debug_macroblock_stats=1;
     p.f_rc_i_weight=5.0; p.f_rc_p_weight=2.0; p.f_rc_b_weight=0.5;
     p.i_rc_method=VC1_RC_CQP; p.i_qp_constant=9; p.i_compute_backend=VC1_COMPUTE_CPU; p.i_simd=VC1_SIMD_SCALAR;
+    vc1_param_t range_bad=p;
+    range_bad.i_subpixel_refinement_range=-1;
+    vc1_t *invalid=vc1_encoder_open(&range_bad);
+    if(invalid){vc1_encoder_close(invalid);return 41;}
+    range_bad.i_subpixel_refinement_range=1025;
+    invalid=vc1_encoder_open(&range_bad);
+    if(invalid){vc1_encoder_close(invalid);return 42;}
+    p.i_subpixel_refinement_range=8;
     vc1_t *e=vc1_encoder_open(&p);
     if (!e) { fprintf(stderr,"open: %s\n",vc1_encoder_last_error(NULL)); return 2; }
-    vc1_param_t actual; if (vc1_encoder_parameters(e,&actual)<0 || actual.i_motion_search_range!=1024 || actual.i_motion_local_search_range!=32 || actual.i_me_quality!=VC1_ME_SATD || actual.f_rc_i_weight!=5.0 || actual.f_rc_p_weight!=2.0 || actual.f_rc_b_weight!=0.5 || actual.i_compute_backend!=VC1_COMPUTE_CPU || actual.i_compute_device!=-1) return 16;
+    vc1_param_t actual; if (vc1_encoder_parameters(e,&actual)<0 || actual.i_motion_search_range!=1024 || actual.i_motion_local_search_range!=32 || actual.i_subpixel_refinement_range!=8 || actual.i_me_quality!=VC1_ME_SATD || actual.f_rc_i_weight!=5.0 || actual.f_rc_p_weight!=2.0 || actual.f_rc_b_weight!=0.5 || actual.i_compute_backend!=VC1_COMPUTE_CPU || actual.i_compute_device!=-1) return 16;
     vc1_au_t *h=NULL; int nh=0;
     if (vc1_encoder_headers(e,&h,&nh)<=0 || nh!=1 || h->i_payload<8) return 3;
     uint8_t y[256],u[64],v[64]; memset(y,96,sizeof(y)); memset(u,128,sizeof(u)); memset(v,128,sizeof(v));

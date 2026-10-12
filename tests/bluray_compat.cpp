@@ -215,9 +215,12 @@ int main() {
         const std::string stats_path="libvc1-bluray-peak-regression.stats";
         p.psz_two_pass_stats_file=stats_path.c_str();
         {
+            // OVERLAP remains enabled for partial macroblocks; the encoder
+            // instead codes friendly hidden intra padding at affected edges.
+            vc1_param_t effective=p;
             std::ofstream f(stats_path,std::ios::binary|std::ios::trunc);
             if (!f) throw std::runtime_error("cannot create Blu-ray stats test fixture");
-            f<<"LIBVC1_TWO_PASS 2 "<<vc1_twopass::signature(p)<<"\n"
+            f<<"LIBVC1_TWO_PASS 2 "<<vc1_twopass::signature(effective)<<"\n"
              <<"F 0 0 0 I 100000 10 1000 8160 0 42 20 10\n"
              <<"END 1 100000\n";
         }

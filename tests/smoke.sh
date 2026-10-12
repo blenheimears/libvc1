@@ -316,23 +316,20 @@ done
 
 # ---- 0.1.25 speed-preset regressions ----
 smoke_section '0.1.25 speed-preset regressions'
-# All speed presets must remain decodable predictive encodes.  In particular,
-# --fastest must preserve P/B picture generation while taking the dedicated
-# zero-motion path rather than silently falling back to all-I coding.
 "$FFMPEG" -hide_banner -loglevel error -f lavfi -i testsrc2=size=160x120:rate=24 \
   -frames:v 12 -pix_fmt yuv420p -f yuv4mpegpipe -y "$TMP/speed.y4m"
-for preset in fast faster fastest; do
-  "$ENCODER" -i "$TMP/speed.y4m" -o "$TMP/$preset.m2ts" --cq 9 --threads 1 --"$preset" \
-    2>"$TMP/$preset.log"
-  "$FFMPEG" -hide_banner -v error -xerror -err_detect explode -i "$TMP/$preset.m2ts" \
-    -frames:v 12 -f null -
-  grep -q "preset=$preset" "$TMP/$preset.log"
-done
-grep -q 'search=8 px' "$TMP/fast.log"
-grep -q 'search=4 px' "$TMP/faster.log"
-grep -Eq '^encoded .*I=[1-9][0-9]*, P=[1-9][0-9]*, B=[1-9][0-9]*.*B-MB=[1-9][0-9]*F/0B/0I/0D.*moved-MB=0, halfchroma-MB=0' "$TMP/fastest.log"
-grep -Fq 'search=0 px (local 0), distant-max-mae=' "$TMP/fastest.log"
-grep -Fq 'me=sad' "$TMP/fastest.log"
+"$ENCODER" -i "$TMP/speed.y4m" -o "$TMP/fast.m2ts" --cq 9 --threads 1 --fast \
+  2>"$TMP/fast.log"
+"$FFMPEG" -hide_banner -v error -xerror -err_detect explode -i "$TMP/fast.m2ts" \
+  -frames:v 12 -f null -
+grep -q 'preset=fast' "$TMP/fast.log"
+grep -Fq 'search=1024 px (local 8)' "$TMP/fast.log"
+grep -Fq 'me-algorithm=diamond, long-range=local-good' "$TMP/fast.log"
+grep -Fq 'subpixel-mode=fast' "$TMP/fast.log"
+grep -Fq 'subpixel-range=16' "$TMP/fast.log"
+grep -Fq 'bframes=2' "$TMP/fast.log"
+grep -Eq 'B=[1-9][0-9]*' "$TMP/fast.log"
+grep -Fq 'me=sad' "$TMP/fast.log"
 
 # Every one of the 3x3 legal table-index pairs must decode to the exact same
 # pixels.  Auto mode must be no larger in elementary-stream bytes than any
@@ -1255,6 +1252,10 @@ cmp "$TMP/abr-recovery-1.m2ts" "$TMP/abr-recovery-4.m2ts"
 # 0.1.41: sustained hard GOPs must not drain VBV until a whole following GOP
 # is forced coarse. This historical threshold fixture pins the former 3.5/1/0.70
 # block weights so the 0.2.32 default-I-weight change does not redefine its baseline.
+# These historical ABR fixtures require B pictures and the pre-0.2.63
+# Historical ABR fixtures retain the old faster settings as explicit options,
+# then restore B pictures, fractional refinement, and fixed transform RDO.
+# Keep the RC thresholds testing the rate controller, not preset selection.
 # Disposable B pictures must never become finer than
 # their P anchors. This compact fixture reproduces the 0.1.40 good/bad-GOP
 # flicker without requiring a large HD encode.
@@ -1277,7 +1278,8 @@ with open(sys.argv[1],'wb') as f:
         f.write(y); f.write(uv); f.write(uv)
 PYABRBALGEN
 "$ENCODER" -i "$TMP/abr-gop-balance.y4m" -o "$TMP/abr-gop-balance.m2ts" \
-  --bitrate 300000 --buffer-size 600000 --keyint 24 --threads 4 --faster \
+  --bitrate 300000 --buffer-size 600000 --keyint 24 --threads 4 --no-trellis --no-aq --no-dquant --no-fade-comp --ac-mode vlc --ac-y-table 1 --ac-c-table 1 --bframes 0 --no-subpixel-refinement --fast-transform-rdo --search-range 4 --local-search-range 4 --me-quality rate --no-scene-cut --variable-transforms \
+  --bframes 2 --subpixel-refinement --fixed-8x8 --full-transform-rdo \
   --i-block-weight 3.5 --p-block-weight 1.0 --b-block-weight 0.70 \
   --rc-stats "$TMP/abr-gop-balance.csv" 2>"$TMP/abr-gop-balance.log"
 python3 - "$TMP/abr-gop-balance.csv" <<'PYABRBAL'
@@ -1356,7 +1358,8 @@ with open(sys.argv[1],'wb') as f:
         f.write(b'FRAME\n'); f.write(y.tobytes()); f.write(uv); f.write(uv)
 PYABRBTEXGEN
 "$ENCODER" -i "$TMP/abr-b-texture.y4m" -o "$TMP/abr-b-texture.m2ts" --es-out "$TMP/abr-b-texture.vc1" \
-  --bitrate 300000 --buffer-size 600000 --keyint 24 --threads 4 --faster \
+  --bitrate 300000 --buffer-size 600000 --keyint 24 --threads 4 --no-trellis --no-aq --no-dquant --no-fade-comp --ac-mode vlc --ac-y-table 1 --ac-c-table 1 --bframes 0 --no-subpixel-refinement --fast-transform-rdo --search-range 4 --local-search-range 4 --me-quality rate --no-scene-cut --variable-transforms \
+  --bframes 2 --subpixel-refinement --fixed-8x8 --full-transform-rdo \
   --rc-stats "$TMP/abr-b-texture.csv" 2>"$TMP/abr-b-texture.log"
 python3 - "$TMP/abr-b-texture.csv" <<'PYABRBTEX'
 import csv,sys
@@ -1405,7 +1408,8 @@ with open(sys.argv[1],'wb') as f:
 PYABRHII
 "$ENCODER" -i "$TMP/abr-hires-i.y4m" -o "$TMP/abr-hires-i.m2ts" \
   --bitrate 37999616 --buffer-size 29999616 --keyint 24 --threads 1 --search-range 0 \
-  --no-scene-cut --no-skip-identical-frames --faster \
+  --no-scene-cut --no-skip-identical-frames --no-trellis --no-aq --no-dquant --no-fade-comp --ac-mode vlc --ac-y-table 1 --ac-c-table 1 --bframes 0 --no-subpixel-refinement --fast-transform-rdo --search-range 4 --local-search-range 4 --me-quality rate --no-scene-cut --variable-transforms \
+  --bframes 2 --subpixel-refinement --fixed-8x8 --full-transform-rdo \
   --i-block-weight 3.5 --p-block-weight 1.0 --b-block-weight 0.70 \
   --rc-stats "$TMP/abr-hires-i.csv" 2>"$TMP/abr-hires-i.log"
 python3 - "$TMP/abr-hires-i.csv" <<'PYABRHICHECK'
@@ -1448,7 +1452,8 @@ with open(sys.argv[1],'wb') as f:
         f.write(y); f.write(uv); f.write(uv)
 PYABRPOSTIGEN
 "$ENCODER" -i "$TMP/abr-post-i.y4m" -o "$TMP/abr-post-i.m2ts" \
-  --bitrate 300000 --buffer-size 600000 --keyint 24 --threads 4 --faster \
+  --bitrate 300000 --buffer-size 600000 --keyint 24 --threads 4 --no-trellis --no-aq --no-dquant --no-fade-comp --ac-mode vlc --ac-y-table 1 --ac-c-table 1 --bframes 0 --no-subpixel-refinement --fast-transform-rdo --search-range 4 --local-search-range 4 --me-quality rate --no-scene-cut --variable-transforms \
+  --bframes 2 --subpixel-refinement --fixed-8x8 --full-transform-rdo \
   --no-skip-identical-frames --rc-stats "$TMP/abr-post-i.csv" 2>"$TMP/abr-post-i.log"
 python3 - "$TMP/abr-post-i.csv" <<'PYABRPOSTI'
 import csv,sys

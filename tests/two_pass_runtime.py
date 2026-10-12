@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='libvc1-two-pass-') as d:
     td=pathlib.Path(d)
     src=td/'in.y4m'; badsrc=td/'bad.y4m'; stats=td/'encode.stats'
     write_y4m(src); write_y4m(badsrc, mutate_frame=5)
-    common=['--bitrate','420k','--buffer-size','700k','--keyint','12','--threads','2','--fastest',
+    common=['--bitrate','420k','--buffer-size','700k','--keyint','12','--threads','2','--no-trellis', '--no-aq', '--no-dquant', '--no-fade-comp', '--fixed-8x8', '--search-range', '0', '--local-search-range', '0',
             '--search-range','4','--local-search-range','4','--no-scene-cut','--simd','none']
     data=src.read_bytes()
     run([enc,'-i','-','--pass','1','--pass-stats',str(stats),*common], data)
@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix='libvc1-two-pass-') as d:
     run([enc,'-i',str(src),'-o',str(td/'out2.vc1'),'--pass','2','--pass-stats',str(stats),*common,'--no-dynamic-ipb-weights','--rc-stats',str(rc2)])
     rows2=list(csv.DictReader(rc2.open()))
     weights2={(round(float(r['effective_i_weight']),6),round(float(r['effective_p_weight']),6),round(float(r['effective_b_weight']),6)) for r in rows2}
-    if weights2!={(5.0,1.0,0.7)}:
+    if weights2!={(4.0,1.0,0.7)}:
         raise SystemExit(f'--no-dynamic-ipb-weights not honored: {weights2}')
 
     p=run([enc,'-i',str(badsrc),'-o',str(td/'bad.vc1'),'--pass','2','--pass-stats',str(stats),*common], ok=False)

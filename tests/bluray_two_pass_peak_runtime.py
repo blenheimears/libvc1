@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory(prefix='libvc1-bd-two-pass-peak-') as tmp:
         video.extend(c)
     common = ['--bluray-compat', '--bitrate', '20M', '--buffer-size', '30M',
               '--keyint', '2', '--fixed-gop-grid', '--bframes', '0',
-              '--threads', '1', '--fastest', '--simd', 'none',
+              '--threads', '1', '--no-trellis', '--no-aq', '--no-dquant', '--no-fade-comp', '--fixed-8x8', '--search-range', '0', '--local-search-range', '0', '--simd', 'none',
               '--search-range', '0', '--local-search-range', '0', '--no-scene-cut']
     stats = base / 'pass.stats'
     def run(extra):

@@ -102,11 +102,13 @@ int main() {
         return 7;
     }
 
-    // Regressions for the reported mode-selection symptom. These deterministic
-    // fixtures used to choose P-intra solely on bottom/right edge macroblocks
-    // because the spatial proxy's mean was dominated by replicated hidden
-    // samples. The visible-only proxy keeps the temporal mode when the visible
-    // samples do not justify an intra escape.
+    // Regressions for the reported mode-selection symptom.  The visibility
+    // guard may now legitimately choose intra for these noisy fixtures when
+    // the formerly attractive inter candidate reads *hidden coded pixels*.
+    // Preserve the visible-only spatial proxy assertions above and require
+    // that whichever mode is emitted cannot leak that padding into a visible
+    // prediction.  Requiring inter unconditionally would contradict the new
+    // reference safety constraint.
     auto random_frame=[](uint32_t seed) {
         Frame f; f.width=18; f.height=18;
         f.y.resize(18*18); f.u.assign(9*9,128); f.v.assign(9*9,128);
@@ -126,14 +128,19 @@ int main() {
     auto p_edge_ok=[&](uint32_t seed,size_t edge_pos) {
         Frame cur=random_frame(seed), ref; perturb(ref,cur,seed^0xa5a5a5a5u,180);
         const auto a=enc.analyze_p_picture_core(cur,ref,Vc1Encoder::ProgressiveMvMode::OneMvQpel,true,nullptr);
-        return edge_pos<a.use_intra.size() && a.use_intra[edge_pos]==0;
+        if(edge_pos>=a.use_intra.size()) return false;
+        const int x=static_cast<int>(edge_pos%2)*16,y=static_cast<int>(edge_pos/2)*16;
+        if(a.use_intra[edge_pos])
+            return !a.use_4mv[edge_pos] && a.mvs[edge_pos].xq==0 && a.mvs[edge_pos].yq==0;
+        return !enc.motion_uses_hidden_padding(x,y,16,16,a.mvs[edge_pos],
+                                               Vc1Encoder::ProgressiveMvMode::OneMvQpel,true);
     };
-    if (!p_edge_ok(814,2)) { std::fprintf(stderr,"bottom-edge P macroblock regressed to intra\n"); return 8; }
-    if (!p_edge_ok(3950,1)) { std::fprintf(stderr,"right-edge P macroblock regressed to intra\n"); return 9; }
-    if (!p_edge_ok(1214,3)) { std::fprintf(stderr,"bottom-right P macroblock regressed to intra\n"); return 10; }
+    if (!p_edge_ok(814,2)) { std::fprintf(stderr,"bottom-edge P macroblock references hidden padding\n"); return 8; }
+    if (!p_edge_ok(3950,1)) { std::fprintf(stderr,"right-edge P macroblock references hidden padding\n"); return 9; }
+    if (!p_edge_ok(1214,3)) { std::fprintf(stderr,"bottom-right P macroblock references hidden padding\n"); return 10; }
 
-    // The B-intra proxy uses the same visible-only mean. Verify both a bottom
-    // and a right edge case without requiring any unsupported SIMD target.
+    // The B-intra proxy uses the same visible-only mean. Check the references
+    // actually used by the selected mode, including derived/direct MVs.
     std::vector<Vc1Encoder::MotionVector> anchor_mvs(4);
     std::vector<uint8_t> anchor_4mv(4,0);
     Vc1Encoder::IntensityComp no_ic{};
@@ -143,10 +150,19 @@ int main() {
         perturb(future,cur,seed^0x5a5a5a5au,255);
         const auto a=enc.analyze_b_picture_mode(cur,past,future,anchor_mvs,anchor_4mv,no_ic,1,2,
                                                 Vc1Encoder::ProgressiveMvMode::OneMvQpel);
-        return edge_pos<a.modes.size() && a.modes[edge_pos]!=Vc1Encoder::BMbMode::Intra;
+        if(edge_pos>=a.modes.size()) return false;
+        const int x=static_cast<int>(edge_pos%2)*16,y=static_cast<int>(edge_pos/2)*16;
+        const auto mode=a.modes[edge_pos];
+        const bool f=mode==Vc1Encoder::BMbMode::Forward || mode==Vc1Encoder::BMbMode::Direct ||
+                     mode==Vc1Encoder::BMbMode::Interpolated;
+        const bool b=mode==Vc1Encoder::BMbMode::Backward || mode==Vc1Encoder::BMbMode::Direct ||
+                     mode==Vc1Encoder::BMbMode::Interpolated;
+        return (!f || !enc.motion_uses_hidden_padding(x,y,16,16,a.forward_mvs[edge_pos],a.mv_mode,true,false)) &&
+               (!b || !enc.motion_uses_hidden_padding(x,y,16,16,a.backward_mvs[edge_pos],a.mv_mode,true,
+                                                       mode==Vc1Encoder::BMbMode::Direct || mode==Vc1Encoder::BMbMode::Interpolated));
     };
-    if (!b_edge_ok(1,2)) { std::fprintf(stderr,"bottom-edge B macroblock regressed to intra\n"); return 11; }
-    if (!b_edge_ok(89,1)) { std::fprintf(stderr,"right-edge B macroblock regressed to intra\n"); return 12; }
+    if (!b_edge_ok(1,2)) { std::fprintf(stderr,"bottom-edge B macroblock references hidden padding\n"); return 11; }
+    if (!b_edge_ok(89,1)) { std::fprintf(stderr,"right-edge B macroblock references hidden padding\n"); return 12; }
 
 
     // Intra transforms must use black luma padding, not edge replication.  The
